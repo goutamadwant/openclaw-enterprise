@@ -64,6 +64,30 @@ function run(root, args, env = {}, { timeout } = {}) {
   });
 }
 
+function mixedPrecisionEventBoundary({ namespace, pod, second, laterCount = 199 }) {
+  const event = (uid, reason, timestamp) => ({
+    metadata: { namespace, name: `${uid}.event`, uid },
+    involvedObject: { kind: "Pod", name: pod, namespace },
+    type: "Normal",
+    reason,
+    message: reason,
+    count: 1,
+    ...timestamp,
+  });
+  const older = event("older-whole-second", "OlderWholeSecond", {
+    lastTimestamp: `${second}Z`,
+  });
+  const newer = event("newer-fractional-second", "NewerFractionalSecond", {
+    eventTime: `${second}.100000Z`,
+  });
+  const later = Array.from({ length: laterCount }, (_, index) =>
+    event(`later-${index}`, `Later${index}`, {
+      eventTime: new Date(Date.parse(`${second}Z`) + (index + 1) * 1_000).toISOString(),
+    }),
+  );
+  return { older, newer, events: [older, newer, ...later] };
+}
+
 // run() without blocking this process, for the waiting tests below, which run side by side.
 // The result has spawnSync's shape, including its ETIMEDOUT error when `timeout` ends the runner.
 function runAsync(root, args, env = {}, { timeout, execArgv = [] } = {}) {
@@ -3438,7 +3462,7 @@ test("run keeps bounded Agent namespace activity from passing k3d files, alone a
       message,
       count,
       firstTimestamp: "2026-09-29T00:00:01Z",
-      lastTimestamp: `2026-09-29T00:00:0${count}Z`,
+      lastTimestamp: `2026-09-29T00:10:0${count}Z`,
     },
   });
   const pods = [
@@ -3447,7 +3471,14 @@ test("run keeps bounded Agent namespace activity from passing k3d files, alone a
     pod(true, "MODIFIED"),
     pod(true, "DELETED"),
   ];
+  const boundary = mixedPrecisionEventBoundary({
+    namespace: "occ-agent-a",
+    pod: "harness-0",
+    second: "2026-09-29T00:00:10",
+    laterCount: 196,
+  });
   const events = [
+    ...boundary.events.map((object) => ({ type: "ADDED", object })),
     event("occ-agent-a", "e1", "Pulled", "Successfully pulled image"),
     event("occ-agent-a", "e2", "Unhealthy", "Readiness probe failed"),
     event("occ-agent-a", "e2", "Unhealthy", "Readiness probe failed", 3),
@@ -3473,7 +3504,7 @@ test("run keeps bounded Agent namespace activity from passing k3d files, alone a
     [
       'import test from "node:test";',
       'import { setTimeout as delay } from "node:timers/promises";',
-      'test("agent file passes", () => delay(300));',
+      'test("agent file passes", () => delay(800));',
       "",
     ].join("\n"),
   );
@@ -3522,8 +3553,15 @@ test("run keeps bounded Agent namespace activity from passing k3d files, alone a
       ["DELETED", true],
     ],
   );
+  assert.equal(activity.events.length, 200);
+  assert.equal(activity.events[0].reason, boundary.newer.reason);
+  assert.equal(
+    activity.events.some(({ reason }) => reason === boundary.older.reason),
+    false,
+  );
+  assert.equal(activity.omitted.events, 1);
   assert.deepEqual(
-    activity.events.map(({ reason, count }) => [reason, count]),
+    activity.events.slice(-3).map(({ reason, count }) => [reason, count]),
     [
       ["Pulled", 1],
       ["Failed", 1],
@@ -4821,6 +4859,13 @@ test("run publishes a failed wait's followed container log, redacted, beside Age
     count: 1,
     lastTimestamp: "2026-10-08T07:43:53Z",
   };
+  const boundary = mixedPrecisionEventBoundary({
+    namespace: "occ-agent-a",
+    pod: "gateway-0",
+    second: "2026-10-08T07:43:52",
+    laterCount: 198,
+  });
+  const events = [...boundary.events, event];
   const logLines = [
     "2026-10-08T07:43:49.1Z [gateway] startup phase: config.auth starting",
     "2026-10-08T07:43:53.2Z [gateway] received SIGTERM; shutting down",
@@ -4848,7 +4893,7 @@ test("run publishes a failed wait's followed container log, redacted, beside Age
       '} else if (args.includes("get") && args.includes("pods")) {',
       `  process.stdout.write(JSON.stringify({ items: [${JSON.stringify(pod)}] }));`,
       '} else if (args.includes("get") && args.includes("events")) {',
-      `  process.stdout.write(JSON.stringify({ items: [${JSON.stringify(event)}] }));`,
+      `  process.stdout.write(JSON.stringify({ items: ${JSON.stringify(events)} }));`,
       "} else {",
       "  setTimeout(() => {}, 60_000);",
       "}",
@@ -4965,9 +5010,24 @@ test("run publishes a failed wait's followed container log, redacted, beside Age
   assert.equal(snapshot.pods[0].deletedAt, "2026-10-08T07:43:53Z");
   assert.equal(snapshot.pods[0].deletionGracePeriodSeconds, 330);
   assert.equal(snapshot.pods[0].containers[0].startedAt, "t");
+  assert.equal(snapshot.events.length, 200);
+  assert.equal(snapshot.events[0].reason, boundary.newer.reason);
+  assert.equal(
+    snapshot.events.some(({ reason }) => reason === boundary.older.reason),
+    false,
+  );
   assert.deepEqual(
-    snapshot.events.map(({ reason, message }) => [reason, message]),
-    [["Killing", "Stopping container gateway"]],
+    snapshot.events.find(({ reason }) => reason === "Killing"),
+    {
+      namespace: "occ-agent-a",
+      kind: "Pod",
+      name: "gateway-0",
+      type: "Normal",
+      reason: "Killing",
+      message: "Stopping container gateway",
+      count: 1,
+      lastTimestamp: "2026-10-08T07:43:53Z",
+    },
   );
   assert.doesNotMatch(text, /do-not-publish|secretauthvalue|childonlysecret/);
   // The record directory lived in the cluster's private directory and is gone.
