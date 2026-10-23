@@ -3499,14 +3499,55 @@ test("run keeps bounded Agent namespace activity from passing k3d files, alone a
     ].join("\n"),
   );
   await chmod(kubectl, 0o755);
-  await writeFile(
-    join(root, "tests/integration/agent.test.mjs"),
+  const captureBarrierDirectory = join(root, "state");
+  const watchAwareTest = ({ name, id }) =>
     [
+      'import { readdir, readFile, writeFile } from "node:fs/promises";',
+      'import { join } from "node:path";',
       'import test from "node:test";',
       'import { setTimeout as delay } from "node:timers/promises";',
-      'test("agent file passes", () => delay(800));',
+      `const clusterDirectory = ${JSON.stringify(clusterDirectory)};`,
+      `const captureBarrierDirectory = ${JSON.stringify(captureBarrierDirectory)};`,
+      "const expectedCaptures = Number(process.env.CI_RUNNER_TEST_EXPECTED_CAPTURES ?? 1);",
+      'const barrier = process.env.CI_RUNNER_TEST_CAPTURE_BARRIER ?? "single";',
+      "const markerPrefix = `capture-ready-${barrier}-`;",
+      `test(${JSON.stringify(name)}, async () => {`,
+      "  if (!process.env.OPENCLAW_CI_CONTAINER_LOG_DIR) return;",
+      "  let watchReady = false;",
+      "  for (let attempt = 0; attempt < 200; attempt += 1) {",
+      "    const names = await readdir(clusterDirectory);",
+      "    const streams = await Promise.all(",
+      '      names.filter((entry) => entry.startsWith("agent-activity-")).map(async (entry) => ({',
+      "        name: entry,",
+      '        lines: (await readFile(join(clusterDirectory, entry), "utf8").catch((error) =>',
+      '          error?.code === "ENOENT" ? "" : Promise.reject(error),',
+      '        )).split("\\n").filter(Boolean).length,',
+      "      })),",
+      "    );",
+      '    const podStreams = streams.filter(({ name: entry }) => entry.endsWith("-pods.ndjson"));',
+      '    const eventStreams = streams.filter(({ name: entry }) => entry.endsWith("-events.ndjson"));',
+      `    const podsReady = podStreams.length > 0 && podStreams.every(({ lines }) => lines >= ${pods.length});`,
+      `    const eventsReady = eventStreams.length > 0 && eventStreams.every(({ lines }) => lines >= ${events.length});`,
+      "    if (podStreams.length === expectedCaptures && eventStreams.length === expectedCaptures && podsReady && eventsReady) {",
+      "      watchReady = true;",
+      "      break;",
+      "    }",
+      "    await delay(10);",
+      "  }",
+      '  if (!watchReady) throw new Error("timed out waiting for Agent namespace watch output");',
+      `  await writeFile(join(captureBarrierDirectory, \`\${markerPrefix}${id}\`), "ready");`,
+      "  for (let attempt = 0; attempt < 200; attempt += 1) {",
+      "    const acknowledgements = (await readdir(captureBarrierDirectory)).filter((entry) => entry.startsWith(markerPrefix));",
+      "    if (acknowledgements.length === expectedCaptures) return;",
+      "    await delay(10);",
+      "  }",
+      '  throw new Error("timed out waiting for concurrent capture acknowledgements");',
+      "});",
       "",
-    ].join("\n"),
+    ].join("\n");
+  await writeFile(
+    join(root, "tests/integration/agent.test.mjs"),
+    watchAwareTest({ name: "agent file passes", id: "agent" }),
   );
   await writeJson(join(root, "scripts/ci/k3d-lane.json"), {
     files: [{ path: "tests/integration/agent.test.mjs", expectedTests: ["agent file passes"] }],
@@ -3531,7 +3572,11 @@ test("run keeps bounded Agent namespace activity from passing k3d files, alone a
       "--results",
       resultsPath,
     ],
-    { OCC_KUBECTL_BIN: kubectl },
+    {
+      OCC_KUBECTL_BIN: kubectl,
+      CI_RUNNER_TEST_CAPTURE_BARRIER: "single",
+      CI_RUNNER_TEST_EXPECTED_CAPTURES: "1",
+    },
   );
 
   assert.equal(result.status, 0, result.stderr);
@@ -3576,12 +3621,7 @@ test("run keeps bounded Agent namespace activity from passing k3d files, alone a
   // keeps its own watch streams, so neither truncates nor deletes the other's capture.
   await writeFile(
     join(root, "tests/integration/agent-sibling.test.mjs"),
-    [
-      'import test from "node:test";',
-      'import { setTimeout as delay } from "node:timers/promises";',
-      'test("sibling file passes", () => delay(300));',
-      "",
-    ].join("\n"),
+    watchAwareTest({ name: "sibling file passes", id: "sibling" }),
   );
   const pairFiles = [
     "tests/integration/agent.test.mjs",
@@ -3621,7 +3661,12 @@ test("run keeps bounded Agent namespace activity from passing k3d files, alone a
       "--results",
       pairResultsPath,
     ],
-    { OCC_KUBECTL_BIN: kubectl, CI_RUNNER_FILE_CONCURRENCY: "2" },
+    {
+      OCC_KUBECTL_BIN: kubectl,
+      CI_RUNNER_FILE_CONCURRENCY: "2",
+      CI_RUNNER_TEST_CAPTURE_BARRIER: "pair",
+      CI_RUNNER_TEST_EXPECTED_CAPTURES: "2",
+    },
   );
   assert.equal(pair.status, 0, pair.stderr);
   const pairSummary = JSON.parse(await readFile(pairResultsPath, "utf8"));
@@ -3694,54 +3739,17 @@ test("run keeps bounded Agent namespace activity from passing k3d files, alone a
   assert.deepEqual(await readdir(clusterDirectory), []);
 });
 
-test("k3d diagnostics retain the newest events across RFC3339 precision variants", async () => {
-  const { projectAgentNamespaceActivity, projectContainerLog } =
-    await import("../../scripts/ci/k3d-diagnostics.mjs");
-  const namespace = "occ-agent-a";
-  const older = {
-    metadata: { namespace, name: "older.event", uid: "older" },
-    involvedObject: { kind: "Pod", name: "harness-0", namespace },
-    reason: "OlderWholeSecond",
-    lastTimestamp: "2026-10-21T00:00:00Z",
-  };
-  const newer = {
-    metadata: { namespace, name: "newer.event", uid: "newer" },
-    involvedObject: { kind: "Pod", name: "harness-0", namespace },
-    reason: "NewerFractionalSecond",
-    eventTime: "2026-10-21T00:00:00.100000Z",
-  };
-  const later = Array.from({ length: 199 }, (_, index) => ({
-    metadata: { namespace, name: `later-${index}.event`, uid: `later-${index}` },
-    involvedObject: { kind: "Pod", name: "harness-0", namespace },
-    reason: `Later${index}`,
-    eventTime: new Date(Date.UTC(2026, 9, 21, 0, 0, index + 1)).toISOString(),
-  }));
-  const events = [older, newer, ...later];
-  const podsText = `${JSON.stringify({
-    type: "ADDED",
-    object: {
-      metadata: { namespace, name: "harness-0" },
-      status: {},
-    },
-  })}\n`;
-  const eventsText = events.map((object) => JSON.stringify({ type: "ADDED", object })).join("\n");
-
-  const activity = projectAgentNamespaceActivity(eventsText, podsText);
-  assert.equal(activity.events.length, 200);
-  assert.equal(
-    activity.events.some(({ reason }) => reason === newer.reason),
-    true,
-  );
-  assert.equal(
-    activity.events.some(({ reason }) => reason === older.reason),
-    false,
-  );
-  assert.equal(activity.events[0].lastTimestamp, newer.eventTime);
-
+test("k3d diagnostics preserve equal-instant event order across precision variants", async () => {
+  const { projectContainerLog } = await import("../../scripts/ci/k3d-diagnostics.mjs");
+  const { older, newer } = mixedPrecisionEventBoundary({
+    namespace: "occ-agent-a",
+    pod: "harness-0",
+    second: "2026-10-21T00:00:00",
+    laterCount: 0,
+  });
   const projected = projectContainerLog({
     lines: [],
     snapshots: [
-      { events },
       {
         events: [
           older,
@@ -3757,11 +3765,8 @@ test("k3d diagnostics retain the newest events across RFC3339 precision variants
       },
     ],
   });
-  const reasons = projected.snapshots[0].events.map(({ reason }) => reason);
-  assert.equal(reasons.includes(newer.reason), true);
-  assert.equal(reasons.includes(older.reason), false);
   assert.deepEqual(
-    projected.snapshots[1].events.map(({ reason }) => reason),
+    projected.snapshots[0].events.map(({ reason }) => reason),
     [older.reason, "EqualFractional", newer.reason],
   );
 });
