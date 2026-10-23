@@ -3656,6 +3656,78 @@ test("run keeps bounded Agent namespace activity from passing k3d files, alone a
   assert.deepEqual(await readdir(clusterDirectory), []);
 });
 
+test("k3d diagnostics retain the newest events across RFC3339 precision variants", async () => {
+  const { projectAgentNamespaceActivity, projectContainerLog } =
+    await import("../../scripts/ci/k3d-diagnostics.mjs");
+  const namespace = "occ-agent-a";
+  const older = {
+    metadata: { namespace, name: "older.event", uid: "older" },
+    involvedObject: { kind: "Pod", name: "harness-0", namespace },
+    reason: "OlderWholeSecond",
+    lastTimestamp: "2026-10-21T00:00:00Z",
+  };
+  const newer = {
+    metadata: { namespace, name: "newer.event", uid: "newer" },
+    involvedObject: { kind: "Pod", name: "harness-0", namespace },
+    reason: "NewerFractionalSecond",
+    eventTime: "2026-10-21T00:00:00.100000Z",
+  };
+  const later = Array.from({ length: 199 }, (_, index) => ({
+    metadata: { namespace, name: `later-${index}.event`, uid: `later-${index}` },
+    involvedObject: { kind: "Pod", name: "harness-0", namespace },
+    reason: `Later${index}`,
+    eventTime: new Date(Date.UTC(2026, 9, 21, 0, 0, index + 1)).toISOString(),
+  }));
+  const events = [older, newer, ...later];
+  const podsText = `${JSON.stringify({
+    type: "ADDED",
+    object: {
+      metadata: { namespace, name: "harness-0" },
+      status: {},
+    },
+  })}\n`;
+  const eventsText = events.map((object) => JSON.stringify({ type: "ADDED", object })).join("\n");
+
+  const activity = projectAgentNamespaceActivity(eventsText, podsText);
+  assert.equal(activity.events.length, 200);
+  assert.equal(
+    activity.events.some(({ reason }) => reason === newer.reason),
+    true,
+  );
+  assert.equal(
+    activity.events.some(({ reason }) => reason === older.reason),
+    false,
+  );
+  assert.equal(activity.events[0].lastTimestamp, newer.eventTime);
+
+  const projected = projectContainerLog({
+    lines: [],
+    snapshots: [
+      { events },
+      {
+        events: [
+          older,
+          {
+            ...older,
+            metadata: { ...older.metadata, uid: "equal-fractional" },
+            reason: "EqualFractional",
+            eventTime: "2026-10-21T00:00:00.000000Z",
+            lastTimestamp: undefined,
+          },
+          newer,
+        ],
+      },
+    ],
+  });
+  const reasons = projected.snapshots[0].events.map(({ reason }) => reason);
+  assert.equal(reasons.includes(newer.reason), true);
+  assert.equal(reasons.includes(older.reason), false);
+  assert.deepEqual(
+    projected.snapshots[1].events.map(({ reason }) => reason),
+    [older.reason, "EqualFractional", newer.reason],
+  );
+});
+
 test("audit fails when a referenced lane cannot be loaded", async (t) => {
   const root = await fixture(t);
   await writeJson(join(root, "manifest.json"), {
