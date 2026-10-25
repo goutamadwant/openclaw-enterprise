@@ -8,6 +8,7 @@ import {
   renderAgentDetail,
 } from "./agents.mjs";
 import { clearRuntimeDenials } from "./agents/logs.mjs";
+import { renderNativeAdminAccess } from "./agents/native-admin.mjs";
 import { createApiClient } from "./api-client.mjs";
 import { createViewLifetime } from "./view-lifetime.mjs";
 import { createNavigation, pages } from "./navigation.mjs";
@@ -60,6 +61,10 @@ const oidcLabelStorageKey = "occ.console.oidcLabel";
 const loginIntentStorageKey = "occ.console.loginIntent";
 const loginIntentLifetimeMs = 10 * 60 * 1000;
 let pendingIntent = null;
+// A native return may authorize exact-Agent administration without granting either Namespace or
+// Agent read. Keep that admitted destination for this session so its launch control can render
+// before ordinary page-read gating.
+let nativeRecovery = null;
 // Google gradient G: https://commons.wikimedia.org/wiki/File_talk:Google_Favicon_2025.svg
 // GitHub mark: https://github.com/primer/octicons/blob/main/icons/mark-github-24.svg
 // A retained view revalidates each read it made. A paged read keeps its cursor, so it compares
@@ -869,6 +874,7 @@ function renderPendingNamespaceShell(feature) {
 
 function clearPrivate() {
   session = null;
+  nativeRecovery = null;
   backendsDenied = false;
   namespaces = [];
   namespaceId = null;
@@ -890,7 +896,15 @@ function clearDrafts() {
 function showExpiredLogin() {
   const current = route();
   // Keep only a validated read destination; reset private views and drafts in showLogin.
-  const destination = pendingIntent ?? captureIntent(pageUrl(current.target, current.namespace));
+  const nativeDestination =
+    nativeRecovery !== null &&
+    current.feature === "agents" &&
+    current.agentId === nativeRecovery.agentId &&
+    current.namespace === nativeRecovery.namespaceId
+      ? { kind: "native", key: nativeRecovery.key }
+      : null;
+  const destination =
+    pendingIntent ?? nativeDestination ?? captureIntent(pageUrl(current.target, current.namespace));
   showLogin("Your session has expired.", destination);
 }
 
@@ -1489,8 +1503,21 @@ async function loadPage({
           revision: null,
           tab: null,
         };
+        const targetUrl = intentUrl(target);
+        if (targetUrl === null) {
+          throw new Error("Invalid native administration return");
+        }
+        deniedReadsFor(owner).forget(
+          `/namespaces/${encodeURIComponent(resolved.namespaceId)}/agents/${encodeURIComponent(resolved.agentId)}/native-admin`,
+        );
+        nativeRecovery = {
+          owner,
+          key: destination.key,
+          namespaceId: resolved?.namespaceId,
+          agentId: resolved?.agentId,
+        };
         pendingIntent = null;
-        replaceUrl(intentUrl(target) ?? "/console/agents");
+        replaceUrl(targetUrl);
       } catch (error) {
         if (!lifetime.isCurrent(active)) {
           return;
@@ -1557,10 +1584,19 @@ async function loadPage({
         namespaces[0]
       )?.id ??
       null;
+    const nativeRecoveryTarget =
+      nativeRecovery?.owner === owner &&
+      current.feature === "agents" &&
+      current.agentId === nativeRecovery.agentId &&
+      namespaceId === nativeRecovery.namespaceId;
+    if (nativeRecovery !== null && !nativeRecoveryTarget) {
+      nativeRecovery = null;
+    }
     replaceUrl(pageUrl(current.target));
     const scopedNamespaceUnavailable =
       ["agents", "secrets"].includes(current.feature) &&
       !namespaces.some((item) => item.id === namespaceId);
+    let recoveringNativeAdmin = nativeRecoveryTarget && scopedNamespaceUnavailable;
     if (current.namespace !== null && (!held || shownFeature === current.feature)) {
       // Namespace admission is done, so the header selector, when the shown page has one, is
       // usable while the destination's first read runs. A switch resets the lifetime, discarding
@@ -1587,9 +1623,17 @@ async function loadPage({
     let firstPermissions = null;
     if (!scopedNamespaceUnavailable && current.feature !== "settings" && !current.creating) {
       if (current.agentId) {
-        firstAgent = await request(
-          `/namespaces/${encodeURIComponent(namespaceId)}/agents/${encodeURIComponent(current.agentId)}`,
-        );
+        try {
+          firstAgent = await request(
+            `/namespaces/${encodeURIComponent(namespaceId)}/agents/${encodeURIComponent(current.agentId)}`,
+          );
+        } catch (error) {
+          if (nativeRecoveryTarget && error.status === 403) {
+            recoveringNativeAdmin = true;
+          } else {
+            throw error;
+          }
+        }
       } else {
         firstItems =
           current.feature === "namespaces"
@@ -1714,7 +1758,8 @@ async function loadPage({
     // so nothing is focused twice (finding 1528). A fresh load whose reads beat the loading
     // delay has no shell yet: its startup status stands in, until the overview reveals or the
     // delay passes and the loading page takes its place (finding 1537).
-    const agentEntry = current.agentId && !current.creating && !scopedNamespaceUnavailable;
+    const agentEntry =
+      current.agentId && !current.creating && !scopedNamespaceUnavailable && !recoveringNativeAdmin;
     const startupStandIn =
       agentEntry && !shell && loadingTimer !== null ? app.querySelector(":scope > .startup") : null;
     const standIn =
@@ -1744,7 +1789,7 @@ async function loadPage({
       shell = renderShell(
         current.feature,
         false,
-        scopedNamespaceUnavailable ? { page: null } : undefined,
+        scopedNamespaceUnavailable || recoveringNativeAdmin ? { page: null } : undefined,
       );
     }
     const viewState = {
@@ -1832,6 +1877,31 @@ async function loadPage({
       }
 
       markMountedRoute(current);
+      return;
+    }
+    if (recoveringNativeAdmin) {
+      clearRetainedViewsForNamespace(namespaceId);
+      panel(
+        shell.view,
+        "Agent native administration",
+        "Native administration is checked separately from Namespace and Agent reads. Namespace and Agent details remain hidden.",
+      );
+      const path = `/namespaces/${encodeURIComponent(namespaceId)}/agents/${encodeURIComponent(current.agentId)}`;
+      const nativeAdmin = renderNativeAdminAccess(
+        {
+          request: viewRequest,
+          isCurrent: () => lifetime.isCurrent(viewState.active),
+          onExpired: () => {
+            if (lifetime.isCurrent(viewState.active)) {
+              showExpiredLogin();
+            }
+          },
+          deniedReads: deniedReadsFor(owner),
+        },
+        path,
+      );
+      shell.view.append(nativeAdmin.section);
+      await nativeAdmin.ready;
       return;
     }
     if (scopedNamespaceUnavailable) {
