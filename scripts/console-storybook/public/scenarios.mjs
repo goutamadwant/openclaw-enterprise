@@ -1706,6 +1706,25 @@ export const scenarios = {
     ],
     gap: "The permission answer is simulated; the API still authorizes Secret creation.",
   },
+  createSecretOperateDenied: {
+    group: "Pages/Create Agent",
+    name: "Secret operate not permitted",
+    path: create,
+    actions: [
+      ...form,
+      { selector: "#agent-name", value: "Slack launch demo" },
+      click("Configure Slack"),
+      { selector: "#slack-dm-policy", value: "disabled" },
+    ],
+    secretOperateDenied: ["sec_demo_slack_backup_token"],
+    description:
+      "The Namespace Secret answer lists the Slack backup token as readable but not operable for this member. Each Create Agent Secret field lists it disabled with the reason and never stages it, since Agent create would refuse it.",
+    steps: [
+      "Type backup in Slack bot token. Slack backup token (simulated) is listed with the access note under it; choosing it stages nothing.",
+      "Close the drawer and type backup in API key Secret: the same option is listed the same way.",
+    ],
+    gap: "The Secret answer is simulated; the API still authorizes Agent create and the Secrets it binds.",
+  },
   createRepositoryNotConfigured: {
     group: "Pages/Create Agent",
     name: "Repository access not set up",
@@ -6220,6 +6239,28 @@ export const scenarios = {
     path: `${draft}&tab=channels`,
     slack: true,
     description: "Enabled Socket Mode with standard unresolved credential references.",
+  },
+  slackDisableReplaceDenied: {
+    group: "Components/Channels",
+    name: "Slack Disable, editor must replace the bot token Secret",
+    path: `${draft}&tab=channels`,
+    slack: true,
+    agentPermissionSummary: {
+      update: true,
+      deploy: true,
+      operate: true,
+      delete: true,
+      administer: true,
+      configurationUpdate: true,
+      configurationRead: true,
+      configurationSecretsOperate: false,
+      configurationSecretsOperateDeniedBindings: ["SLACK_BOT_TOKEN"],
+      agentSourcesOperate: false,
+      sandboxPolicyRead: true,
+    },
+    description:
+      "The permission answer lists the bot token binding as the only one whose Secret the editor cannot operate. Disable saves no bindings, so it would keep that Secret bound: Disable Slack is shown disabled with a note to choose another Secret in Edit Slack first. Edit Slack stays available.",
+    gap: "The permission answer is simulated, so a rebind here does not enable Disable; the browser test covers that step.",
   },
   slackThreadedDefault: {
     group: "Components/Channels",

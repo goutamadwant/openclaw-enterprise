@@ -11,10 +11,13 @@ import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs
 import { createTestSecretDriver } from "../helpers/secret-driver.mjs";
 import {
   accessBindingPostRequests,
+  AGENT_READ,
   apiRequests,
   detailUrl,
   expectNoText,
   expireSessions,
+  grantMember,
+  grantSecretOperate,
   hasFocus,
   holdRequests,
   login,
@@ -30,6 +33,7 @@ import {
   persistedDeploymentError,
   recordLayoutShifts,
   revealNativeConfiguration,
+  revokeMemberGrant,
   secretOptionLabel,
   secretPostRequests,
   selectSecret,
@@ -44,6 +48,7 @@ import {
   statusTone,
   isMaskedSecretValue,
 } from "./console-agents-browser-helpers.mjs";
+import { FIRST_ACTIVITY_WAIT_MS } from "../../apps/controller/src/console/agents/detail.mts";
 import { createRuntimeAuthFixture } from "./console-agents-runtime-auth-fixture.mjs";
 import {
   deploymentRecordUrl,
@@ -2291,9 +2296,7 @@ test("the Credentials tab's inline Create Secret follows the Secret create answe
   assert.equal(secretPostRequests(requests, namespace.id).length, 0);
 
   // A Secret create grant restores the action on the next page load.
-  fixture.policy.roles
-    .find((role) => role.id === "role-inline-create-member")
-    .permissions.push({ action: "create", resourceKind: "secret" });
+  grantMember(fixture, "inline-create-member", [["create", "secret"]]);
   await page.reload();
   await waitForInputValue(picker, bound.name);
   await waitForEnabled(picker);
@@ -3317,25 +3320,12 @@ test("Agent stop keeps a used card for a viewer who reads no version", async (t)
     harnessAuth: { method: "runtime" },
   });
   const active = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
-  const operator = await fixture.createAccountWithPolicy("agent-stop-unreadable", (principal) => {
-    fixture.policy.roles.push({
-      id: "role-console-agent-stop-unreadable",
-      namespaceId: namespace.id,
-      permissions: [
-        { action: "read", resourceKind: "namespace" },
-        { action: "read", resourceKind: "agent" },
-        { action: "read", resourceKind: "configuration" },
-        { action: "operate", resourceKind: "agent" },
-      ],
-    });
-    fixture.policy.bindings.push({
-      id: "binding-console-agent-stop-unreadable",
-      namespaceId: namespace.id,
-      subjectKind: "identity",
-      subjectId: principal.id,
-      roleId: "role-console-agent-stop-unreadable",
-    });
-  });
+  const operator = await fixture.createNamespaceMember("agent-stop-unreadable", namespace.id, [
+    ["read", "namespace"],
+    ["read", "agent"],
+    ["read", "configuration"],
+    ["operate", "agent"],
+  ]);
   const { page } = await newPage(t, fixture);
   await login(
     page,
@@ -3555,25 +3545,11 @@ test("Agent stop denial keeps the Agent running with permission feedback", async
     },
   );
   const active = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
-  const limited = await fixture.createAccountWithPolicy("agent-stop-denied", (principal) => {
-    fixture.policy.roles.push({
-      id: "role-console-agent-stop-denied",
-      namespaceId: namespace.id,
-      permissions: [
-        { action: "read", resourceKind: "namespace" },
-        { action: "read", resourceKind: "agent" },
-        { action: "read", resourceKind: "configuration" },
-        { action: "read", resourceKind: "agent_revision" },
-      ],
-    });
-    fixture.policy.bindings.push({
-      id: "binding-console-agent-stop-denied",
-      namespaceId: namespace.id,
-      subjectKind: "identity",
-      subjectId: principal.id,
-      roleId: "role-console-agent-stop-denied",
-    });
-  });
+  const limited = await fixture.createNamespaceMember(
+    "agent-stop-denied",
+    namespace.id,
+    AGENT_READ,
+  );
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
 
@@ -3614,25 +3590,11 @@ test("a read-only principal sees Agent mutation controls disabled or absent befo
   const namespace = await fixture.createNamespace("Read-only controls", { ready: true });
   const agent = await fixture.createAgent(namespace.id, "Read-only Agent", nativeValues("ro"));
   const active = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
-  const viewer = await fixture.createAccountWithPolicy("agent-controls-viewer", (principal) => {
-    fixture.policy.roles.push({
-      id: "role-console-agent-controls-viewer",
-      namespaceId: namespace.id,
-      permissions: [
-        { action: "read", resourceKind: "namespace" },
-        { action: "read", resourceKind: "agent" },
-        { action: "read", resourceKind: "configuration" },
-        { action: "read", resourceKind: "agent_revision" },
-      ],
-    });
-    fixture.policy.bindings.push({
-      id: "binding-console-agent-controls-viewer",
-      namespaceId: namespace.id,
-      subjectKind: "identity",
-      subjectId: principal.id,
-      roleId: "role-console-agent-controls-viewer",
-    });
-  });
+  const viewer = await fixture.createNamespaceMember(
+    "agent-controls-viewer",
+    namespace.id,
+    AGENT_READ,
+  );
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
 
@@ -3807,26 +3769,10 @@ test("the danger zone offers only the rows the caller's permission answer allows
   const namespace = await fixture.createNamespace("Delete only", { ready: true });
   const agent = await fixture.createAgent(namespace.id, "Delete Only Agent", nativeValues("do"));
   const active = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
-  const deleter = await fixture.createAccountWithPolicy("danger-zone-deleter", (principal) => {
-    fixture.policy.roles.push({
-      id: "role-danger-zone-deleter",
-      namespaceId: namespace.id,
-      permissions: [
-        ...["namespace", "agent", "agent_revision", "configuration"].map((resourceKind) => ({
-          action: "read",
-          resourceKind,
-        })),
-        { action: "delete", resourceKind: "agent" },
-      ],
-    });
-    fixture.policy.bindings.push({
-      id: "binding-danger-zone-deleter",
-      namespaceId: namespace.id,
-      subjectKind: "identity",
-      subjectId: principal.id,
-      roleId: "role-danger-zone-deleter",
-    });
-  });
+  const deleter = await fixture.createNamespaceMember("danger-zone-deleter", namespace.id, [
+    ...AGENT_READ,
+    ["delete", "agent"],
+  ]);
   const { page } = await newPage(t, fixture);
   await login(
     page,
@@ -3982,27 +3928,11 @@ test("a version editor without Agent update can recover a failed deployment from
   );
   const active = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
   const failed = await fixture.deployAgent(namespace.id, agent.id);
-  const editor = await fixture.createAccountWithPolicy("version-editor", (principal) => {
-    fixture.policy.roles.push({
-      id: "role-version-editor",
-      namespaceId: namespace.id,
-      permissions: [
-        { action: "read", resourceKind: "namespace" },
-        { action: "read", resourceKind: "agent" },
-        { action: "deploy", resourceKind: "agent" },
-        { action: "read", resourceKind: "agent_revision" },
-        { action: "read", resourceKind: "configuration" },
-        { action: "update", resourceKind: "configuration" },
-      ],
-    });
-    fixture.policy.bindings.push({
-      id: "binding-version-editor",
-      namespaceId: namespace.id,
-      subjectKind: "identity",
-      subjectId: principal.id,
-      roleId: "role-version-editor",
-    });
-  });
+  const editor = await fixture.createNamespaceMember("version-editor", namespace.id, [
+    ...AGENT_READ,
+    ["deploy", "agent"],
+    ["update", "configuration"],
+  ]);
   const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
   const { page } = await newPage(t, fixture);
   // The fixture has no deployment worker; supply its persisted failure record for v2.
@@ -4030,6 +3960,7 @@ test("a version editor without Agent update can recover a failed deployment from
     afterServer: true,
     once: true,
   });
+  await page.clock.install();
   await login(
     page,
     fixture,
@@ -4037,6 +3968,9 @@ test("a version editor without Agent update can recover a failed deployment from
     editor.credentials,
   );
   await firstPermissions.requested;
+  // The held answer keeps the page behind its stand-in until the overview's bounded wait runs
+  // out; run it out rather than wait for it.
+  await page.clock.fastForward(FIRST_ACTIVITY_WAIT_MS);
   await page.locator(".revision-create").waitFor();
   const summary = page.waitForResponse((r) => r.url().endsWith(path + "/permissions"));
   firstPermissions.release();
@@ -4084,8 +4018,6 @@ test("a version editor without Agent update can recover a failed deployment from
   const permission = await holdRequests(t, page, `${fixture.origin}${path}/permissions`, {
     once: true,
   });
-  const role = fixture.policy.roles.find(({ id }) => id === "role-version-editor");
-  const originalPermissions = role.permissions;
   const saving = page.waitForResponse(
     (r) =>
       r.request().method() === "PATCH" &&
@@ -4101,9 +4033,7 @@ test("a version editor without Agent update can recover a failed deployment from
     await recovery.getByRole("link", { name: "Open Configuration", exact: true }).isVisible(),
     true,
   );
-  role.permissions = originalPermissions.filter(
-    ({ action, resourceKind }) => action !== "update" || resourceKind !== "configuration",
-  );
+  const restoreGrants = revokeMemberGrant(fixture, "version-editor", ["update", "configuration"]);
   const reread = page.waitForResponse((r) => r.url().endsWith(path + "/permissions"));
   permission.release();
   assert.equal((await (await reread).json()).data.configurationUpdate, false);
@@ -4114,7 +4044,7 @@ test("a version editor without Agent update can recover a failed deployment from
     .waitFor({ state: "detached" });
   await recovery.getByRole("link", { name: "Open version draft", exact: true }).waitFor();
 
-  role.permissions = originalPermissions;
+  restoreGrants();
   await page.reload();
 
   const deploying = page.waitForResponse(
@@ -4139,8 +4069,13 @@ const REPLACE_BOT_TOKEN =
   "Your access does not include Secret operate on the Secret bound to Slack bot token. Each save needs it for every Secret it keeps bound, so choose another Secret for it before saving.";
 const KEEPS_BOT_TOKEN =
   "This save keeps Slack bot token on a Secret your access cannot operate. Choose another Secret for it, then save.";
-// Slack Socket Mode reading the bound token names.
-const BOUND_SLACK = {
+const DISABLE_KEEPS_BOT_TOKEN =
+  "Disabling keeps Slack bot token on a Secret your access cannot operate. Choose another Secret for it in Edit Slack first, then disable.";
+const AGENT_SOURCES_DENIED =
+  "Saving these settings needs operate on each Secret and credential source this Agent and its Configuration bind, which your access does not include. Ask an administrator for that access.";
+// Slack Socket Mode reading its tokens from SLACK_APP_TOKEN and SLACK_BOT_TOKEN, which a test
+// binds to Secrets or leaves unbound.
+const SOCKET_SLACK = {
   enabled: true,
   mode: "socket",
   appToken: { source: "env", provider: "default", id: "SLACK_APP_TOKEN" },
@@ -4163,12 +4098,7 @@ test("a reader without update views the version draft read-only", async (t) => {
     harnessAuth: { method: "runtime" },
   });
   const active = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
-  const reader = await fixture.createNamespaceMember("draft-reader", namespace.id, [
-    ["read", "namespace"],
-    ["read", "agent"],
-    ["read", "agent_revision"],
-    ["read", "configuration"],
-  ]);
+  const reader = await fixture.createNamespaceMember("draft-reader", namespace.id, AGENT_READ);
   const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
@@ -4253,12 +4183,11 @@ test("a late permission answer relabels a reader's version entry and skips plugi
     harnessAuth: { method: "runtime" },
   });
   const active = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
-  const reader = await fixture.createNamespaceMember("late-plugin-reader", namespace.id, [
-    ["read", "namespace"],
-    ["read", "agent"],
-    ["read", "agent_revision"],
-    ["read", "configuration"],
-  ]);
+  const reader = await fixture.createNamespaceMember(
+    "late-plugin-reader",
+    namespace.id,
+    AGENT_READ,
+  );
   const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
@@ -4267,6 +4196,7 @@ test("a late permission answer relabels a reader's version entry and skips plugi
     afterServer: true,
     once: true,
   });
+  await page.clock.install();
   await login(
     page,
     fixture,
@@ -4274,6 +4204,9 @@ test("a late permission answer relabels a reader's version entry and skips plugi
     reader.credentials,
   );
   await firstAnswer.requested;
+  // The held answer keeps the page behind its stand-in until the overview's bounded wait runs
+  // out; run it out rather than wait for it.
+  await page.clock.fastForward(FIRST_ACTIVITY_WAIT_MS);
   const snapshot = page
     .locator("section.agent-card")
     .filter({ has: page.getByRole("heading", { name: "Configuration snapshot" }) });
@@ -4306,11 +4239,8 @@ test("an Agent editor without Configuration update sees the Configuration read-o
   });
   await fixture.seedActiveAgentRevision(namespace.id, agent.id);
   const member = await fixture.createNamespaceMember("agent-only-editor", namespace.id, [
-    ["read", "namespace"],
-    ["read", "agent"],
+    ...AGENT_READ,
     ["update", "agent"],
-    ["read", "agent_revision"],
-    ["read", "configuration"],
   ]);
   const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
   const { page } = await newPage(t, fixture);
@@ -4379,11 +4309,8 @@ test("an editor without operate on a bound Secret views the version draft read-o
   );
   const active = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
   const member = await fixture.createNamespaceMember("unoperated-secret-editor", namespace.id, [
-    ["read", "namespace"],
-    ["read", "agent"],
+    ...AGENT_READ,
     ["update", "agent"],
-    ["read", "agent_revision"],
-    ["read", "configuration"],
     ["update", "configuration"],
   ]);
   const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
@@ -4439,28 +4366,15 @@ test("a deployer without update keeps the draft checklist", async (t) => {
   await fixture.bootstrap();
   const namespace = await fixture.createNamespace("Draft deployer", { ready: true });
   // Slack is on and its token Secrets are not bound, so the draft is not ready to deploy.
-  const slack = {
-    enabled: true,
-    mode: "socket",
-    appToken: { source: "env", provider: "default", id: "SLACK_APP_TOKEN" },
-    botToken: { source: "env", provider: "default", id: "SLACK_BOT_TOKEN" },
-    dmPolicy: "allowlist",
-    groupPolicy: "allowlist",
-    allowFrom: ["U123"],
-    channels: { C123: { requireMention: true } },
-  };
   const agent = await fixture.createAgent(
     namespace.id,
     "Draft deployer Agent",
-    nativeValues("slack", { harnessId: "codex", channels: { slack } }),
+    nativeValues("slack", { harnessId: "codex", channels: { slack: SOCKET_SLACK } }),
     { executionMode: "dedicated" },
   );
   const deployer = await fixture.createNamespaceMember("draft-deployer", namespace.id, [
-    ["read", "namespace"],
-    ["read", "agent"],
+    ...AGENT_READ,
     ["deploy", "agent"],
-    ["read", "agent_revision"],
-    ["read", "configuration"],
   ]);
   const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
   const { page } = await newPage(t, fixture);
@@ -4492,27 +4406,14 @@ test("a late permission answer turns a reader's Channels and Channel Secrets rea
   await fixture.bootstrap();
   const namespace = await fixture.createNamespace("Late reader answer", { ready: true });
   // Slack is on and its token Secrets are not bound yet, so an editor's draft offers to set them.
-  const slack = {
-    enabled: true,
-    mode: "socket",
-    appToken: { source: "env", provider: "default", id: "SLACK_APP_TOKEN" },
-    botToken: { source: "env", provider: "default", id: "SLACK_BOT_TOKEN" },
-    dmPolicy: "allowlist",
-    groupPolicy: "allowlist",
-    allowFrom: ["U123"],
-    channels: { C123: { requireMention: true } },
-  };
   const agent = await fixture.createAgent(
     namespace.id,
     "Late reader Agent",
-    nativeValues("slack", { harnessId: "codex", channels: { slack } }),
+    nativeValues("slack", { harnessId: "codex", channels: { slack: SOCKET_SLACK } }),
     { executionMode: "dedicated" },
   );
   const reader = await fixture.createNamespaceMember("late-reader", namespace.id, [
-    ["read", "namespace"],
-    ["read", "agent"],
-    ["read", "agent_revision"],
-    ["read", "configuration"],
+    ...AGENT_READ,
     ["read", "secret"],
   ]);
   const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
@@ -4522,6 +4423,7 @@ test("a late permission answer turns a reader's Channels and Channel Secrets rea
     afterServer: true,
     once: true,
   });
+  await page.clock.install();
   await login(
     page,
     fixture,
@@ -4529,6 +4431,9 @@ test("a late permission answer turns a reader's Channels and Channel Secrets rea
     reader.credentials,
   );
   await firstPermissions.requested;
+  // The held answer keeps the page behind its stand-in until the overview's bounded wait runs
+  // out; run it out rather than wait for it.
+  await page.clock.fastForward(FIRST_ACTIVITY_WAIT_MS);
   // Until the answer lands the page assumes an editor.
   await page.getByText(/^Save and Disable update only the shared Configuration draft\./).waitFor();
   await page.getByRole("button", { name: "Set up credentials", exact: true }).waitFor();
@@ -4586,7 +4491,7 @@ test("a Configuration editor without Secret operate on a kept bound Secret reads
   const agent = await fixture.createAgent(
     namespace.id,
     "Bound Secrets Agent",
-    nativeValues("bound", { harnessId: "codex", channels: { slack: BOUND_SLACK } }),
+    nativeValues("bound", { harnessId: "codex", channels: { slack: SOCKET_SLACK } }),
     {
       executionMode: "dedicated",
       secretBindings: {
@@ -4598,10 +4503,7 @@ test("a Configuration editor without Secret operate on a kept bound Secret reads
     },
   );
   const member = await fixture.createNamespaceMember("bound-secrets-editor", namespace.id, [
-    ["read", "namespace"],
-    ["read", "agent"],
-    ["read", "agent_revision"],
-    ["read", "configuration"],
+    ...AGENT_READ,
     ["update", "configuration"],
     ["read", "secret"],
   ]);
@@ -4643,21 +4545,21 @@ test("a Configuration editor without Secret operate on a kept bound Secret reads
   assert.deepEqual(nonAuthWriteRequests(requests), []);
 });
 
-// A save is checked on the Secrets it submits, not on the ones it replaces. A member who may not
-// operate the administrator's bot token Secret, but may operate the app token Secret and their
-// own, can bind their own Secret for the bot token. A save that keeps the administrator's Secret
-// is refused before any request, naming the binding to replace (finding 2444).
-test("a channel Secrets save may replace a bound Secret the member cannot operate", async (t) => {
+// The replace persona (finding 2444): a member with Configuration update who may operate the app
+// token Secret and their own Secret, but not the administrator's bot token Secret, which the
+// draft binds. `agentUpdate` adds Agent update and operate on the model key Secret, so only the
+// bot token Secret refuses Agent-side saves (finding 2470).
+async function replaceSecretFixture(t, label, { agentUpdate = false } = {}) {
   const fixture = await createConsoleAppFixture(t);
   await fixture.bootstrap();
-  const namespace = await fixture.createNamespace("Replaced Secret editor", { ready: true });
+  const namespace = await fixture.createNamespace(label, { ready: true });
   const app = await fixture.createSecret(namespace.id, "Admin app token", "xapp-admin-value");
   const bot = await fixture.createSecret(namespace.id, "Admin bot token", "xoxb-admin-value");
   const own = await fixture.createSecret(namespace.id, "Member bot token", "xoxb-member-value");
   const agent = await fixture.createAgent(
     namespace.id,
-    "Replaced Secret Agent",
-    nativeValues("bound", { harnessId: "codex", channels: { slack: BOUND_SLACK } }),
+    `${label} Agent`,
+    nativeValues("bound", { harnessId: "codex", channels: { slack: SOCKET_SLACK } }),
     {
       executionMode: "dedicated",
       secretBindings: {
@@ -4666,33 +4568,38 @@ test("a channel Secrets save may replace a bound Secret the member cannot operat
       },
     },
   );
-  const member = await fixture.createNamespaceMember("replaced-secret-editor", namespace.id, [
-    ["read", "namespace"],
-    ["read", "agent"],
-    ["read", "agent_revision"],
-    ["read", "configuration"],
+  const slug = label.toLowerCase().replaceAll(" ", "-");
+  const member = await fixture.createNamespaceMember(slug, namespace.id, [
+    ...AGENT_READ,
     ["update", "configuration"],
     ["read", "secret"],
+    ...(agentUpdate ? [["update", "agent"]] : []),
   ]);
-  // Secret operate on the app token Secret and the member's own Secret only.
-  fixture.policy.roles.push({
-    id: "role-replaced-secret-operator",
-    namespaceId: namespace.id,
-    permissions: [{ action: "operate", resourceKind: "secret" }],
-  });
-  for (const secret of [app, own]) {
-    fixture.policy.bindings.push({
-      id: `binding-replaced-secret-operator-${secret.id}`,
-      namespaceId: namespace.id,
-      subjectKind: "identity",
-      subjectId: member.principal.id,
-      roleId: "role-replaced-secret-operator",
-      resourceKind: "secret",
-      resourceId: secret.id,
-    });
+  const operated = [app.id, own.id];
+  if (agentUpdate) {
+    const { data } = await fixture.request("GET", `/namespaces/${namespace.id}/agents/${agent.id}`);
+    operated.push(data.harnessAuth.source.id);
   }
-  const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
-  const configurationPath = `/namespaces/${namespace.id}/configurations/${agent.configurationId}`;
+  grantSecretOperate(fixture, namespace.id, member.principal, operated);
+  return {
+    fixture,
+    namespace,
+    agent,
+    member,
+    app,
+    own,
+    path: `/namespaces/${namespace.id}/agents/${agent.id}`,
+    configurationPath: `/namespaces/${namespace.id}/configurations/${agent.configurationId}`,
+  };
+}
+
+// A save is checked on the Secrets it submits, not on the ones it replaces. A member who may not
+// operate the administrator's bot token Secret, but may operate the app token Secret and their
+// own, can bind their own Secret for the bot token. A save that keeps the administrator's Secret
+// is refused before any request, naming the binding to replace (finding 2444).
+test("a channel Secrets save may replace a bound Secret the member cannot operate", async (t) => {
+  const { fixture, namespace, agent, member, app, own, path, configurationPath } =
+    await replaceSecretFixture(t, "Replaced Secret editor");
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
   const permissions = page.waitForResponse((r) => r.url().endsWith(path + "/permissions"));
@@ -4774,49 +4681,8 @@ test("a channel Secrets save may replace a bound Secret the member cannot operat
 // The Channels drawer saves the same bindings. While the administrator's bot token Secret stays
 // bound, its save is refused before any request; replacing it saves (finding 2444).
 test("the Channels drawer save must replace a bound Secret the member cannot operate", async (t) => {
-  const fixture = await createConsoleAppFixture(t);
-  await fixture.bootstrap();
-  const namespace = await fixture.createNamespace("Replaced Secret drawer", { ready: true });
-  const app = await fixture.createSecret(namespace.id, "Admin app token", "xapp-admin-value");
-  const bot = await fixture.createSecret(namespace.id, "Admin bot token", "xoxb-admin-value");
-  const own = await fixture.createSecret(namespace.id, "Member bot token", "xoxb-member-value");
-  const agent = await fixture.createAgent(
-    namespace.id,
-    "Replaced drawer Agent",
-    nativeValues("bound", { harnessId: "codex", channels: { slack: BOUND_SLACK } }),
-    {
-      executionMode: "dedicated",
-      secretBindings: {
-        SLACK_APP_TOKEN: { source: app.ref, delivery: { type: "env" } },
-        SLACK_BOT_TOKEN: { source: bot.ref, delivery: { type: "env" } },
-      },
-    },
-  );
-  const member = await fixture.createNamespaceMember("replaced-drawer-editor", namespace.id, [
-    ["read", "namespace"],
-    ["read", "agent"],
-    ["read", "agent_revision"],
-    ["read", "configuration"],
-    ["update", "configuration"],
-    ["read", "secret"],
-  ]);
-  fixture.policy.roles.push({
-    id: "role-replaced-drawer-operator",
-    namespaceId: namespace.id,
-    permissions: [{ action: "operate", resourceKind: "secret" }],
-  });
-  for (const secret of [app, own]) {
-    fixture.policy.bindings.push({
-      id: `binding-replaced-drawer-operator-${secret.id}`,
-      namespaceId: namespace.id,
-      subjectKind: "identity",
-      subjectId: member.principal.id,
-      roleId: "role-replaced-drawer-operator",
-      resourceKind: "secret",
-      resourceId: secret.id,
-    });
-  }
-  const configurationPath = `/namespaces/${namespace.id}/configurations/${agent.configurationId}`;
+  const { fixture, namespace, agent, member, app, own, configurationPath } =
+    await replaceSecretFixture(t, "Replaced drawer editor");
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
   await login(
@@ -4862,7 +4728,7 @@ test("Secret fields refuse a readable Secret the editor cannot operate", async (
   const agent = await fixture.createAgent(
     namespace.id,
     "Operate-only Agent",
-    nativeValues("bound", { harnessId: "codex", channels: { slack: BOUND_SLACK } }),
+    nativeValues("bound", { harnessId: "codex", channels: { slack: SOCKET_SLACK } }),
     {
       executionMode: "dedicated",
       secretBindings: {
@@ -4872,34 +4738,20 @@ test("Secret fields refuse a readable Secret the editor cannot operate", async (
     },
   );
   const member = await fixture.createNamespaceMember("operate-only-editor", namespace.id, [
-    ["read", "namespace"],
-    ["read", "agent"],
-    ["read", "agent_revision"],
+    ...AGENT_READ,
     ["update", "agent"],
-    ["read", "configuration"],
     ["update", "configuration"],
     ["read", "secret"],
   ]);
   // Secret operate on the bound Secrets, the Harness authentication Secret and the extra token:
   // every save is allowed, but binding the spare token is not.
-  fixture.policy.roles.push({
-    id: "role-operate-only-secrets",
-    namespaceId: namespace.id,
-    permissions: [{ action: "operate", resourceKind: "secret" }],
-  });
-  const grantOperate = (secretId) =>
-    fixture.policy.bindings.push({
-      id: `binding-operate-only-secrets-${secretId}`,
-      namespaceId: namespace.id,
-      subjectKind: "identity",
-      subjectId: member.principal.id,
-      roleId: "role-operate-only-secrets",
-      resourceKind: "secret",
-      resourceId: secretId,
-    });
-  for (const secretId of [app.id, bot.id, extra.id, other.id, agent.harnessAuth.source.id]) {
-    grantOperate(secretId);
-  }
+  const operate = grantSecretOperate(fixture, namespace.id, member.principal, [
+    app.id,
+    bot.id,
+    extra.id,
+    other.id,
+    agent.harnessAuth.source.id,
+  ]);
   const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
   const configurationPath = `/namespaces/${namespace.id}/configurations/${agent.configurationId}`;
   const { page } = await newPage(t, fixture);
@@ -4945,12 +4797,7 @@ test("Secret fields refuse a readable Secret the editor cannot operate", async (
   await page.getByRole("tab", { name: "Credentials", exact: true }).click();
   await selectSecret(page, "Slack bot token", extra);
   await page.getByText("Secret binding staged. Save changes to apply it.").waitFor();
-  fixture.policy.bindings.splice(
-    fixture.policy.bindings.findIndex(
-      (binding) => binding.id === `binding-operate-only-secrets-${extra.id}`,
-    ),
-    1,
-  );
+  operate.revoke(extra.id);
   const refused = page.waitForResponse(
     (r) => r.request().method() === "PATCH" && r.url().endsWith(configurationPath),
   );
@@ -4965,17 +4812,8 @@ test("Secret fields refuse a readable Secret the editor cannot operate", async (
   // the refusal keeps the text that names both grants.
   await selectSecret(page, "Slack bot token", other);
   await page.getByText("Secret binding staged. Save changes to apply it.").waitFor();
-  fixture.policy.bindings.splice(
-    fixture.policy.bindings.findIndex(
-      (binding) => binding.id === `binding-operate-only-secrets-${other.id}`,
-    ),
-    1,
-  );
-  const editorRole = fixture.policy.roles.find((role) => role.id === "role-operate-only-editor");
-  editorRole.permissions = editorRole.permissions.filter(
-    (permission) =>
-      !(permission.action === "update" && permission.resourceKind === "configuration"),
-  );
+  operate.revoke(other.id);
+  revokeMemberGrant(fixture, "operate-only-editor", ["update", "configuration"]);
   const refusedAgain = page.waitForResponse(
     (r) => r.request().method() === "PATCH" && r.url().endsWith(configurationPath),
   );
@@ -4995,18 +4833,14 @@ test("a Channels tab parked before a reader's permission answer returns read-onl
   const agent = await fixture.createAgent(namespace.id, "Parked reader Agent", nativeValues("v1"), {
     harnessAuth: { method: "runtime" },
   });
-  const reader = await fixture.createNamespaceMember("parked-reader", namespace.id, [
-    ["read", "namespace"],
-    ["read", "agent"],
-    ["read", "agent_revision"],
-    ["read", "configuration"],
-  ]);
+  const reader = await fixture.createNamespaceMember("parked-reader", namespace.id, AGENT_READ);
   const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
   const { page } = await newPage(t, fixture);
   const firstPermissions = await holdRequests(t, page, `${fixture.origin}${path}/permissions`, {
     afterServer: true,
     once: true,
   });
+  await page.clock.install();
   await login(
     page,
     fixture,
@@ -5014,6 +4848,9 @@ test("a Channels tab parked before a reader's permission answer returns read-onl
     reader.credentials,
   );
   await firstPermissions.requested;
+  // The held answer keeps the page behind its stand-in until the overview's bounded wait runs
+  // out; run it out rather than wait for it.
+  await page.clock.fastForward(FIRST_ACTIVITY_WAIT_MS);
   await page.getByText(/^Save and Disable update only the shared Configuration draft\./).waitFor();
   // Park the editor's Channels view, then let the answer land on the Configuration tab.
   await page.getByRole("tab", { name: "Configuration", exact: true }).click();
@@ -5021,8 +4858,9 @@ test("a Channels tab parked before a reader's permission answer returns read-onl
   firstPermissions.release();
   await page.getByText(CONFIGURATION_READ_ONLY, { exact: true }).waitFor();
   await page.getByRole("tab", { name: "Channels", exact: true }).click();
-  await page.getByText(CHANNELS_READ_ONLY, { exact: true }).waitFor();
-  await expectNoText(page, /^Save and Disable update only the shared Configuration draft\./);
+  await expectNoText(page, /^Save and Disable update only the shared Configuration draft\./, () =>
+    page.getByText(CHANNELS_READ_ONLY, { exact: true }).waitFor(),
+  );
 });
 
 // A draft refresh reads the permission answer again. When the reread revokes Configuration
@@ -5035,10 +4873,7 @@ test("a permission reread after a save turns the draft read-only", async (t) => 
   });
   await fixture.seedActiveAgentRevision(namespace.id, agent.id);
   const editor = await fixture.createNamespaceMember("reread-editor", namespace.id, [
-    ["read", "namespace"],
-    ["read", "agent"],
-    ["read", "agent_revision"],
-    ["read", "configuration"],
+    ...AGENT_READ,
     ["update", "configuration"],
   ]);
   const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
@@ -5077,10 +4912,7 @@ test("a permission reread after a save turns the draft read-only", async (t) => 
   });
   await page.getByRole("button", { name: "Save Configuration" }).click();
   await patch.requested;
-  const role = fixture.policy.roles.find(({ id }) => id === "role-reread-editor");
-  role.permissions = role.permissions.filter(
-    ({ action, resourceKind }) => action !== "update" || resourceKind !== "configuration",
-  );
+  revokeMemberGrant(fixture, "reread-editor", ["update", "configuration"]);
   patch.release();
   await reread.requested;
   // The rebuilt tab is drawn from the previous answer while the reread is held.
@@ -5106,27 +4938,17 @@ test("a negative permission answer reaching an open Stop or Delete dialog preven
     },
   );
   const active = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
-  const viewer = await fixture.createAccountWithPolicy("confirmation-viewer", (principal) => {
-    fixture.policy.roles.push({
-      id: "role-confirmation-viewer",
-      namespaceId: namespace.id,
-      permissions: ["namespace", "agent", "agent_revision", "configuration"].map(
-        (resourceKind) => ({ action: "read", resourceKind }),
-      ),
-    });
-    fixture.policy.bindings.push({
-      id: "binding-confirmation-viewer",
-      namespaceId: namespace.id,
-      subjectKind: "identity",
-      subjectId: principal.id,
-      roleId: "role-confirmation-viewer",
-    });
-  });
+  const viewer = await fixture.createNamespaceMember(
+    "confirmation-viewer",
+    namespace.id,
+    AGENT_READ,
+  );
   const url = detailUrl(fixture, namespace.id, agent.id, active.revision.id, "configuration");
   const permissionPath =
     fixture.origin + "/namespaces/" + namespace.id + "/agents/" + agent.id + "/permissions";
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
+  await page.clock.install();
   for (const action of ["Stop", "Delete"]) {
     // Delay delivery, not authorization: these are the controller's actual flags for this viewer.
     const permissions = await holdRequests(t, page, permissionPath, {
@@ -5139,6 +4961,9 @@ test("a negative permission answer reaching an open Stop or Delete dialog preven
       await page.goto(url.href);
     }
     const received = await permissions.requested;
+    // The held answer keeps the page behind its stand-in until the overview's bounded wait runs
+    // out; run it out rather than wait for it.
+    await page.clock.fastForward(FIRST_ACTIVITY_WAIT_MS);
     assert.deepEqual(
       { status: received.status(), data: (await received.json()).data },
       {
@@ -5230,4 +5055,124 @@ test("the draft Configuration card paints no stray text beside its controls", as
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
   await card.getByText("View native Configuration").waitFor();
   assert.deepEqual(await strayText(), []);
+});
+
+// Agent-side saves check operate on every Secret the Configuration binds, so the administrator's
+// bot token Secret also makes Plugins, Repositories and the authentication source read-only for
+// this member. Rebinding the bot token on the member's own Secret lifts that: the page reads the
+// answer again and those tabs become editable without a reload (finding 2470).
+test("a channel save that rebinds a denied Secret makes the Agent-side tabs editable", async (t) => {
+  const { fixture, namespace, agent, member, app, own, path, configurationPath } =
+    await replaceSecretFixture(t, "Rebound sources editor", { agentUpdate: true });
+  const { page } = await newPage(t, fixture);
+  const permissions = page.waitForResponse((r) => r.url().endsWith(path + "/permissions"));
+  await login(
+    page,
+    fixture,
+    detailUrl(fixture, namespace.id, agent.id, "draft", "plugins"),
+    member.credentials,
+  );
+  assert.equal((await (await permissions).json()).data.agentSourcesOperate, false);
+  await page.getByText(PLUGINS_READ_ONLY, { exact: true }).waitFor();
+  await page.getByText(AGENT_SOURCES_DENIED, { exact: true }).waitFor();
+  // Repositories is drawn now and parked, so its rebuild is proved too, not only a first draw.
+  await page.getByRole("tab", { name: "Repositories", exact: true }).click();
+  await page.getByText(AGENT_SOURCES_DENIED, { exact: true }).waitFor();
+  assert.equal(await page.locator("#repository-selection-title").count(), 0);
+  await page.getByRole("tab", { name: "Credentials", exact: true }).click();
+  const saveSource = page.getByRole("button", { name: "Save authentication source" });
+  await page.getByText(AGENT_SOURCES_DENIED, { exact: true }).waitFor();
+  assert.equal(await saveSource.isDisabled(), true);
+
+  await selectSecret(page, "Slack bot token", own);
+  const saving = page.waitForResponse(
+    (r) => r.request().method() === "PATCH" && r.url().endsWith(configurationPath),
+  );
+  const reread = page.waitForResponse((r) => r.url().endsWith(path + "/permissions"));
+  await page.getByRole("button", { name: "Save channel Secrets" }).click();
+  assert.equal((await saving).status(), 200);
+  assert.equal((await (await reread).json()).data.agentSourcesOperate, true);
+  // The authentication source form is updated in place; the panel keeps its saved state.
+  await expectNoText(page, AGENT_SOURCES_DENIED, () => waitForEnabled(saveSource));
+  await waitForInputValue(page.getByLabel("Slack app token"), secretOptionLabel(app));
+  await page.getByRole("tab", { name: "Plugins", exact: true }).click();
+  await page.getByRole("button", { name: "Save plugin selections" }).waitFor();
+  assert.equal(await page.getByText(PLUGINS_READ_ONLY, { exact: true }).count(), 0);
+  await page.getByRole("tab", { name: "Repositories", exact: true }).click();
+  // The editor's selection, not the read-only summary with the sources note.
+  await expectNoText(page, AGENT_SOURCES_DENIED, () =>
+    page.locator("#repository-selection-title").waitFor(),
+  );
+});
+
+// A tab drawn after the save but before the page's reread answers shows the old denial; the
+// answer rebuilds it while it is shown (finding 2470).
+test("a Plugins tab shown before the reread answers becomes editable when it lands", async (t) => {
+  const { fixture, namespace, agent, member, own, path, configurationPath } =
+    await replaceSecretFixture(t, "Held reread editor", { agentUpdate: true });
+  const { page } = await newPage(t, fixture);
+  const permissions = page.waitForResponse((r) => r.url().endsWith(path + "/permissions"));
+  await login(
+    page,
+    fixture,
+    detailUrl(fixture, namespace.id, agent.id, "draft", "credentials"),
+    member.credentials,
+  );
+  await permissions;
+  await selectSecret(page, "Slack bot token", own);
+  const reread = await holdRequests(t, page, `${fixture.origin}${path}/permissions`, {
+    afterServer: true,
+    once: true,
+  });
+  const saving = page.waitForResponse(
+    (r) => r.request().method() === "PATCH" && r.url().endsWith(configurationPath),
+  );
+  await page.getByRole("button", { name: "Save channel Secrets" }).click();
+  assert.equal((await saving).status(), 200);
+  await reread.requested;
+  await page.getByRole("tab", { name: "Plugins", exact: true }).click();
+  await page.getByText(PLUGINS_READ_ONLY, { exact: true }).waitFor();
+  reread.release();
+  await expectNoText(page, AGENT_SOURCES_DENIED, () =>
+    page.getByRole("button", { name: "Save plugin selections" }).waitFor(),
+  );
+});
+
+// Disable Slack saves no bindings, so it keeps the administrator's bot token Secret bound and the
+// API would refuse it. The card offers it disabled, naming the binding to rebind first; after Edit
+// Slack rebinds it, Disable saves (finding 2471).
+test("Disable Slack waits until the replace persona rebinds the denied Secret", async (t) => {
+  const { fixture, namespace, agent, member, own, configurationPath } = await replaceSecretFixture(
+    t,
+    "Replaced disable editor",
+  );
+  const { page } = await newPage(t, fixture);
+  const requests = apiRequests(page, fixture.origin);
+  await login(
+    page,
+    fixture,
+    detailUrl(fixture, namespace.id, agent.id, "draft", "channels"),
+    member.credentials,
+  );
+  const disable = page.getByRole("button", { name: "Disable Slack" });
+  await page.getByText(DISABLE_KEEPS_BOT_TOKEN, { exact: true }).waitFor();
+  assert.equal(await disable.isDisabled(), true);
+  assert.deepEqual(nonAuthWriteRequests(requests), []);
+
+  await page.getByRole("button", { name: "Edit Slack" }).click();
+  const dialog = page.getByRole("dialog", { name: "Edit Slack" });
+  await selectSecret(dialog, "Slack bot token", own);
+  const rebinding = page.waitForResponse(
+    (r) => r.request().method() === "PATCH" && r.url().endsWith(configurationPath),
+  );
+  await dialog.getByRole("button", { name: "Save configuration" }).click();
+  assert.equal((await rebinding).status(), 200);
+  await expectNoText(page, DISABLE_KEEPS_BOT_TOKEN, () => waitForEnabled(disable));
+  const disabling = page.waitForResponse(
+    (r) => r.request().method() === "PATCH" && r.url().endsWith(configurationPath),
+  );
+  await disable.click();
+  assert.equal((await disabling).status(), 200);
+  const saved = await fixture.request("GET", configurationPath);
+  assert.equal(saved.data.values.channels.slack.enabled, false);
 });
