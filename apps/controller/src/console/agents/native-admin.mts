@@ -30,6 +30,10 @@ function readAvailability(value: unknown): Availability {
 
 function unavailableText(status: Availability["status"]) {
   switch (status) {
+    case "denied":
+      return "Your account can no longer administer this Agent. Ask an administrator to restore access, then refresh.";
+    case "disabled":
+      return "Native admin UI access is disabled. Ask an administrator to enable it, then refresh.";
     case "stopped":
       return "Start this Agent before opening its native admin UI.";
     case "unsupported":
@@ -43,11 +47,16 @@ function unavailableText(status: Availability["status"]) {
 
 export function renderNativeAdminAccess(
   context: Omit<AgentAccessContext, "namespaceId"> & {
-    deniedReads?: { has(path: string): boolean; remember(path: string): void };
+    deniedReads?: {
+      has(path: string): boolean;
+      remember(path: string): void;
+      forget?(path: string): void;
+    };
   },
   path: string,
   // The caller's latest advisory Agent administer answer; undefined when it is unknown.
   administerAllowed?: () => Promise<boolean | undefined>,
+  { showDenied = false }: { showDenied?: boolean } = {},
 ) {
   const statusPath = `${path}/native-admin`;
   const status = element("p", { className: "hint", role: "status" }, "Checking access…");
@@ -64,7 +73,14 @@ export function renderNativeAdminAccess(
     "Open admin console",
     element("span", { "aria-hidden": "true" }, "↗"),
   );
-  const reload = button("Refresh access", () => void load(), { className: "overview-text-button" });
+  const reload = button(
+    "Refresh access",
+    () => {
+      context.deniedReads?.forget?.(statusPath);
+      void load();
+    },
+    { className: "overview-text-button" },
+  );
   const scope = element(
     "p",
     { id: "native-admin-scope" },
@@ -110,7 +126,8 @@ export function renderNativeAdminAccess(
     status.hidden = !launch.hidden;
     section.hidden =
       !failed &&
-      (current === undefined || current.status === "disabled" || current.status === "denied");
+      (current === undefined ||
+        (!showDenied && (current.status === "disabled" || current.status === "denied")));
   }
 
   async function load() {
@@ -119,9 +136,9 @@ export function renderNativeAdminAccess(
     }
     // Native admin needs Agent administer; a 403 is audited, so this tab asks once per Agent.
     if (context.deniedReads?.has(statusPath)) {
-      current = undefined;
+      current = showDenied ? { status: "denied" } : undefined;
       failed = false;
-      status.textContent = "";
+      status.textContent = showDenied ? unavailableText("denied") : "";
       updateControls();
       return;
     }
@@ -153,7 +170,7 @@ export function renderNativeAdminAccess(
       if (current.status === "available") {
         status.textContent = "Native admin UI is available for this Agent’s current version.";
       } else if (current.status === "disabled" || current.status === "denied") {
-        status.textContent = "";
+        status.textContent = showDenied ? unavailableText(current.status) : "";
       } else {
         status.textContent = unavailableText(current.status);
       }
@@ -170,9 +187,9 @@ export function renderNativeAdminAccess(
         context.deniedReads?.remember(statusPath);
       }
       failed = failureStatus !== 403;
-      current = undefined;
-      status.textContent = "";
-      error.textContent = message(cause);
+      current = showDenied && failureStatus === 403 ? { status: "denied" } : undefined;
+      status.textContent = current?.status === "denied" ? unavailableText("denied") : "";
+      error.textContent = failureStatus === 403 ? "" : message(cause);
     } finally {
       if (context.isCurrent()) {
         pending = false;

@@ -893,8 +893,7 @@ function clearDrafts() {
   draftUserId = null;
 }
 
-function showExpiredLogin() {
-  const current = route();
+function expiredDestination(current) {
   // Keep only a validated read destination; reset private views and drafts in showLogin.
   const nativeDestination =
     nativeRecovery !== null &&
@@ -903,9 +902,13 @@ function showExpiredLogin() {
     current.namespace === nativeRecovery.namespaceId
       ? { kind: "native", key: nativeRecovery.key }
       : null;
-  const destination =
-    pendingIntent ?? nativeDestination ?? captureIntent(pageUrl(current.target, current.namespace));
-  showLogin("Your session has expired.", destination);
+  return (
+    pendingIntent ?? nativeDestination ?? captureIntent(pageUrl(current.target, current.namespace))
+  );
+}
+
+function showExpiredLogin() {
+  showLogin("Your session has expired.", expiredDestination(route()));
 }
 
 function showLogin(message = "", destination = null) {
@@ -1449,9 +1452,7 @@ async function loadPage({
     session = resolvedSession;
     if (session === null) {
       const destination =
-        providerError !== null || current.feature === "login"
-          ? null
-          : (pendingIntent ?? captureIntent(pageUrl(current.target, current.namespace)));
+        providerError !== null || current.feature === "login" ? null : expiredDestination(current);
       showLogin(
         providerError !== null
           ? (reasonFailure ?? providerFailure(providerError.label))
@@ -1883,8 +1884,8 @@ async function loadPage({
       clearRetainedViewsForNamespace(namespaceId);
       panel(
         shell.view,
-        "Agent native administration",
-        "Native administration is checked separately from Namespace and Agent reads. Namespace and Agent details remain hidden.",
+        "Native admin UI",
+        "Your account cannot view this Agent's details in OCE. Native admin access is checked separately.",
       );
       const path = `/namespaces/${encodeURIComponent(namespaceId)}/agents/${encodeURIComponent(current.agentId)}`;
       const nativeAdmin = renderNativeAdminAccess(
@@ -1899,6 +1900,8 @@ async function loadPage({
           deniedReads: deniedReadsFor(owner),
         },
         path,
+        undefined,
+        { showDenied: true },
       );
       shell.view.append(nativeAdmin.section);
       await nativeAdmin.ready;

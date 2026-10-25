@@ -2709,7 +2709,7 @@ test("native recovery remains usable with exact Agent administer and no Namespac
     await page.getByLabel("Password").fill(account.credentials.password);
     await page.getByRole("button", { name: "Sign in" }).click();
 
-    await page.getByRole("heading", { name: "Agent native administration" }).waitFor();
+    await page.getByRole("heading", { name: "Native admin UI" }).waitFor();
     const launch = page.getByRole("link", { name: "Open admin console", exact: true });
     await launch.waitFor();
     assert.equal(await launch.getAttribute("href"), native.data.url);
@@ -2749,16 +2749,27 @@ test("native recovery remains usable with exact Agent administer and no Namespac
       );
       await page.goto(`${fixture.origin}/console/#native-agent=${key}`);
       await page.waitForURL(`**/console/agents/${agent.id}?namespace=${namespace.id}`);
-      assert.deepEqual(
-        await page.evaluate(() =>
-          JSON.parse(globalThis.sessionStorage.getItem("occ.console.deniedReads") ?? "null"),
-        ),
-        { owner, paths: [] },
+      await launch.waitFor();
+
+      const bindingIndex = fixture.policy.bindings.findIndex(
+        (binding) => binding.id === "binding-native-recovery-admin-administer",
       );
+      assert.notEqual(bindingIndex, -1);
+      const [administerBinding] = fixture.policy.bindings.splice(bindingIndex, 1);
+      await page.getByRole("button", { name: "Refresh access", exact: true }).click();
+      await page
+        .getByText(
+          "Your account can no longer administer this Agent. Ask an administrator to restore access, then refresh.",
+          { exact: true },
+        )
+        .waitFor();
+      assert.equal(await launch.isVisible(), false);
+      fixture.policy.bindings.push(administerBinding);
+      await page.getByRole("button", { name: "Refresh access", exact: true }).click();
       await launch.waitFor();
 
       expireSessions(fixture);
-      await page.getByRole("button", { name: "Refresh access", exact: true }).click();
+      await page.evaluate(() => globalThis.dispatchEvent(new Event("focus")));
       await page.getByText("Your session has expired.", { exact: true }).waitFor();
       await page.getByLabel("Email", { exact: true }).fill(account.credentials.email);
       await page.getByLabel("Password").fill(account.credentials.password);

@@ -83,7 +83,10 @@ says so once. The [native Agent host](../agent-native-admin.md) redirects
 a qualifying root or chat navigation here. Opening native chat still requires a separate user action.
 If that recovery view's session expires, sign-in retains the opaque key and resolves it again
 rather than trusting the prior result. A successful return also clears a same-session cached
-native-status denial before the independently authorized availability read.
+native-status denial before the independently authorized availability read. If that status read
+is denied, the recovery view explains that administration access changed and lets the operator
+retry after access is restored. The recovery state is tab-local: reload and Back clear it, so the
+operator must open the original native link again.
 `authError=<provider>` shows a generic, one-time error; with `authError=github`, an
 `authReason` of `membership` or `membership-unavailable` explains a GitHub
 [allowlist](../../reference/authentication/external-sign-in.md#organization-and-team-allowlist)
