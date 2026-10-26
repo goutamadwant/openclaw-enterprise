@@ -72,6 +72,7 @@ import { syntheticCredentialUrl } from "../fixtures/synthetic-credential-url.mjs
 import { createOccLogger, emitOccLogEvent } from "../../apps/controller/src/logging.ts";
 import { harnessTlsFixture } from "../helpers/harness-tls.mjs";
 import { conformanceKubeconfig } from "../helpers/kubernetes-compute.mjs";
+import { unreadableSlackTokenRefusal } from "../helpers/refusal-text.mjs";
 import {
   tenant,
   apiKeyAuth,
@@ -10427,6 +10428,21 @@ test("native channel providers require Secret bindings and project them only to 
     {
       name: "ConfigurationHarnessError",
       message: `Configuration setting channels.slack.accounts.ops.relay.authToken contains \${relay}, which the runtime does not substitute: ${useUppercase}.`,
+    },
+  );
+  // Admission refuses a Slack token SecretRef the Slack Channel Driver cannot read, as save does
+  // (finding 2514).
+  assert.throws(
+    () =>
+      driver.validateHarnessAuth(
+        revision.harness,
+        revision.harnessAuth,
+        slackAccount({ botToken: { source: "file", provider: "default", id: "/run/slack/bot" } }),
+        {},
+      ),
+    {
+      name: "ConfigurationHarnessError",
+      message: unreadableSlackTokenRefusal("channels.slack.accounts.ops.botToken", "secretRef"),
     },
   );
   // Outside a secret-input field the runtime keeps `$NAME` and other `${` text as written, and a

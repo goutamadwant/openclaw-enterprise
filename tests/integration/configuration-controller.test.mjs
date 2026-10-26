@@ -25,6 +25,7 @@ import {
 } from "../helpers/auth-session.mjs";
 import { bindRole } from "../helpers/iam-grants.mjs";
 import { syntheticCredentialUrl } from "../fixtures/synthetic-credential-url.mjs";
+import { referenceFormRefusal, unreadableSlackTokenRefusal } from "../helpers/refusal-text.mjs";
 import { temporaryDirectory } from "../helpers/temporary-directory.mjs";
 
 function createConfigurationBackend() {
@@ -387,6 +388,8 @@ const unsubstitutedChannelReference = (path, shown) =>
   setting(path, `contains ${shown}, which the runtime does not substitute: ${useUppercase}`);
 const unsubstitutedChannelText = (path) =>
   setting(path, `contains a \${ the runtime does not substitute: ${useUppercase}`);
+// A Slack token SecretRef the Slack Channel Driver cannot read (finding 2514).
+const unreadableSlackReference = (path) => unreadableSlackTokenRefusal(path, "secretRef");
 const absoluteUrl = (field) =>
   `Configuration field ${field} must be an absolute http or https URL.`;
 const modelApi = (field) =>
@@ -1599,6 +1602,94 @@ test("Configuration create, update and Agent create's check refuse a channel cre
   ]) {
     const checked = await validate(configuration);
     assert.equal(checked.status, 204, JSON.stringify(checked.body));
+  }
+});
+
+// The Slack Channel Driver reads a token only from an env SecretRef with the default provider or
+// one whole `${NAME}`, and refuses any other SecretRef with binding_required at provisioning and
+// deployment. Save refuses those where the binding rule runs, for exactly the tokens the Driver
+// checks, naming the setting and never the value (finding 2514).
+test("Configuration save and Agent create's check refuse a Slack token SecretRef the Slack Channel Driver cannot read", async (t) => {
+  // The real Filesystem Configuration Driver, whose credential slot rule runs after OCC's.
+  const root = await temporaryDirectory(t, "occ-slack-token-refs-");
+  const { namespace, collection, ...context } = await fixture({
+    configurationDriver: new FilesystemConfigurationDriver(root),
+    computeDriver: kubernetesRules("compute-slack-token-refs", ...configurationRules),
+    computeImplementation: "kubernetes-local",
+  });
+  await context.controller.transact((state) =>
+    state.namespaces.transitionNamespaceStatus(namespace.id, "provisioning", "ready"),
+  );
+  const binding = async (name) => {
+    const secret = await context.controller.createSecret(context.principal.id, {
+      namespaceId: namespace.id,
+      name,
+      value: `synthetic-${name}`,
+    });
+    return { source: secret.ref, delivery: { type: "env" } };
+  };
+  const secretBindings = {
+    SLACK_APP_TOKEN: await binding("slack-app"),
+    SLACK_BOT_TOKEN: await binding("slack-bot"),
+  };
+  const appToken = { source: "env", provider: "default", id: "SLACK_APP_TOKEN" };
+  const fileRef = { source: "file", provider: "default", id: "/run/slack/bot" };
+  const slackWith = (slack) => ({
+    ...runtimeSelected,
+    channels: {
+      slack: { enabled: true, mode: "socket", appToken, botToken: "${SLACK_BOT_TOKEN}", ...slack },
+    },
+  });
+  const save = (values) =>
+    request(context.app, "POST", collection, { body: { kind: "agent", values, secretBindings } });
+  const validate = (values) =>
+    request(context.app, "POST", `/namespaces/${namespace.id}/agents/validate`, {
+      body: {
+        configuration: { kind: "agent", values, secretBindings },
+        executionMode: "dedicated",
+      },
+    });
+
+  for (const [slack, path] of [
+    [{ botToken: fileRef }, "channels.slack.botToken"],
+    [{ appToken: { source: "exec", provider: "default", id: "slack" } }, "channels.slack.appToken"],
+    [
+      { botToken: { source: "env", provider: "vault", id: "SLACK_BOT_TOKEN" } },
+      "channels.slack.botToken",
+    ],
+    [{ accounts: { work: { botToken: fileRef } } }, "channels.slack.accounts.work.botToken"],
+    // An account named "default" replaces the implicit one, and inherits the channel's token.
+    [{ botToken: fileRef, accounts: { default: { appToken } } }, "channels.slack.botToken"],
+  ]) {
+    const values = slackWith(slack);
+    const label = JSON.stringify(slack);
+    assertRefused(await save(values), unreadableSlackReference(path), {
+      label,
+      sentinel: "/run/slack/bot",
+    });
+    assertRefused(await validate(values), unreadableSlackReference(path), { label });
+  }
+  // The Driver reads no other object either, and the Configuration Driver accepts one there, so
+  // it is refused without being called a SecretRef, never echoing the value (finding 2518).
+  for (const botToken of [{ value: "xoxb-not-a-reference" }, {}]) {
+    assertRefused(
+      await save(slackWith({ botToken })),
+      unreadableSlackTokenRefusal("channels.slack.botToken", "object"),
+      { label: JSON.stringify(botToken), sentinel: "xoxb-not-a-reference" },
+    );
+  }
+  // The Driver skips the app token in HTTP mode, a disabled account and fields it does not read,
+  // and the channel's token when an account called "default" sets its own (finding 2519).
+  for (const slack of [
+    { mode: "http", appToken: fileRef },
+    { accounts: { work: { enabled: false, botToken: fileRef } } },
+    { signingSecret: fileRef },
+    { botToken: fileRef, accounts: { default: { appToken, botToken: "${SLACK_BOT_TOKEN}" } } },
+    // The Driver reads an env SecretRef without a provider as the default one.
+    { botToken: { source: "env", id: "SLACK_BOT_TOKEN" } },
+  ]) {
+    const saved = await save(slackWith(slack));
+    assert.equal(saved.status, 201, `${JSON.stringify(slack)}: ${JSON.stringify(saved.body)}`);
   }
 });
 
@@ -4130,6 +4221,10 @@ test("Configuration and Preset saves refuse a literal secret in the other slots 
     at(field, value),
     message(field),
   ];
+  // A channel setting is named as the channel rules name it, `channels.telegram.botToken`
+  // (finding 2517).
+  const channelLiteral = (field) =>
+    referenceFormRefusal(field.slice(1).replaceAll("/", "."), "inline");
   const tokenUrl = `https://chat.example.test/?token=${sentinel}`;
   const refused = [
     // Slots the pinned OpenClaw schema registers sensitive.
@@ -4146,22 +4241,22 @@ test("Configuration and Preset saves refuse a literal secret in the other slots 
     slot("/agents/defaults/sandbox/ssh/knownHostsData"),
     slot("/storage/locations/backup/encryption/passphrase"),
     // Channel settings: a token, an account's password and an inline service account.
-    slot("/channels/telegram/botToken"),
-    slot("/channels/matrix/accounts/work/password"),
-    slot("/channels/googlechat/serviceAccount", literalKey, { private_key: sentinel }),
+    slot("/channels/telegram/botToken", channelLiteral),
+    slot("/channels/matrix/accounts/work/password", channelLiteral),
+    slot("/channels/googlechat/serviceAccount", channelLiteral, { private_key: sentinel }),
     // A field only the channel's manifest marks sensitive: a URL that carries a token.
-    slot("/channels/synology-chat/incomingUrl", literalKey, tokenUrl),
-    slot("/channels/synology-chat/accounts/ops/webhookUrl", literalKey, tokenUrl),
-    slot("/channels/synology-chat/webhookUrl", literalKey, tokenUrl),
-    slot("/channels/synology-chat/accounts/ops/incomingUrl", literalKey, tokenUrl),
+    slot("/channels/synology-chat/incomingUrl", channelLiteral, tokenUrl),
+    slot("/channels/synology-chat/accounts/ops/webhookUrl", channelLiteral, tokenUrl),
+    slot("/channels/synology-chat/webhookUrl", channelLiteral, tokenUrl),
+    slot("/channels/synology-chat/accounts/ops/incomingUrl", channelLiteral, tokenUrl),
     // Each word of the rule: a secret, an encryption key, a service account reference.
-    slot("/channels/line/channelSecret"),
-    slot("/channels/feishu/encryptKey"),
-    slot("/channels/googlechat/serviceAccountRef"),
+    slot("/channels/line/channelSecret", channelLiteral),
+    slot("/channels/feishu/encryptKey", channelLiteral),
+    slot("/channels/googlechat/serviceAccountRef", channelLiteral),
     // Two literals in one channel: the first in the document is named.
     [
       { channels: { telegram: { botToken: sentinel, webhookSecret: sentinel } } },
-      literalKey("/channels/telegram/botToken"),
+      channelLiteral("/channels/telegram/botToken"),
     ],
     // Plugin settings: a key, an account's password, a list entry, a field only the manifest
     // marks sensitive and a headers map.
@@ -4199,7 +4294,7 @@ test("Configuration and Preset saves refuse a literal secret in the other slots 
     variables: { token: { type: "string" } },
     configuration: { values: { channels: { telegram: { botToken: "{{ vars.token }}" } } } },
   });
-  assertRefused(variable, literalKey("/channels/telegram/botToken"));
+  assertRefused(variable, channelLiteral("/channels/telegram/botToken"));
   await assertNothingStored(context, [`${created.body.data.id}.json`]);
 
   // `${NAME}` and SecretRef references still save, and so do settings the rule leaves alone:
@@ -4264,6 +4359,53 @@ test("Configuration and Preset saves refuse a literal secret in the other slots 
       },
     },
   });
+});
+
+test("a credential reference that is not the whole value is refused with a message naming its form", async (t) => {
+  // Finding 2493: a bound Slack token written as `$NAME`, with a fallback or inside other text
+  // passed the channel binding rule and fell to the inline-credential message, which reads as if
+  // the reference were a credential. The refusal stays; its message names the form and what to
+  // write, and never the text around the reference or the fallback, which may hold the token.
+  const context = await saveFixture(t);
+  const created = await request(context.app, "POST", context.collection, {
+    body: { kind: "agent", values: {} },
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const item = `${context.collection}/${created.body.data.id}`;
+  const sentinel = `synthetic-${randomUUID()}`;
+  // The message names the setting as the channel binding rules do (finding 2503).
+  const shorthand = (path) => referenceFormRefusal(path, "shorthand");
+  const fallback = (path) => referenceFormRefusal(path, "fallback");
+  const otherText = (path) => referenceFormRefusal(path, "otherText");
+  const slack = (botToken) => ({ channels: { slack: { enabled: true, botToken } } });
+  const bot = "channels.slack.botToken";
+  for (const [values, message] of [
+    [slack("$SLACK_BOT_TOKEN"), shorthand(bot)],
+    [slack("${SLACK_BOT_TOKEN:-}"), fallback(bot)],
+    [slack(`\${SLACK_BOT_TOKEN:-${sentinel}}`), fallback(bot)],
+    [slack(`${sentinel}-\${SLACK_BOT_TOKEN}`), otherText(bot)],
+    [slack("xoxb-${SLACK_BOT_TOKEN}"), otherText(bot)],
+    // A line break or a second reference is not text, but still not the whole value (finding 2503).
+    [slack("${SLACK_BOT_TOKEN}\n"), otherText(bot)],
+    [slack("${SLACK_BOT_TOKEN}${SLACK_APP_TOKEN}"), otherText(bot)],
+    // Any key slot: a plugin's API key and the Gateway's remote token.
+    [
+      {
+        plugins: {
+          entries: { brave: { config: { webSearch: { apiKey: "Bearer ${BRAVE_KEY}" } } } },
+        },
+      },
+      otherText("plugins.entries.brave.config.webSearch.apiKey"),
+    ],
+    [{ gateway: { remote: { token: "$REMOTE_TOKEN" } } }, shorthand("gateway.remote.token")],
+    // An escape renders literal text, so it is a literal credential, with that message. So is a
+    // `$` before a name the runtime does not read as one (finding 2517).
+    [slack("$${SLACK_BOT_TOKEN}"), referenceFormRefusal(bot, "inline")],
+    [slack(`$xoxb${sentinel}`), referenceFormRefusal(bot, "inline")],
+  ]) {
+    await refusedOnSave(context, values, message, { item, sentinel });
+  }
+  await assertNothingStored(context, [`${created.body.data.id}.json`]);
 });
 
 test("Preset and Configuration saves refuse a baseUrl or api that a variable fills with no host or no string", async (t) => {

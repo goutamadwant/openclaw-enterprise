@@ -5,6 +5,7 @@ import type {
 } from "@openclaw-enterprise/contracts";
 import { responseFields } from "../api-client.mjs";
 import type { createDraftStore } from "../drafts.mjs";
+import type { SecretsOperateDenied } from "../agents/credential-access.mjs";
 import type { SlackDirectoryContext } from "../agents/slack-directory.mjs";
 import {
   element,
@@ -54,7 +55,7 @@ export interface ChannelDrawerContext extends SlackDirectoryContext {
   // The Namespace permission answer's secrets.create, for the token fields' inline Create Secret.
   secretsCreateAllowed?: (() => Promise<boolean | undefined>) | undefined;
   // Readable Secrets the caller may not operate, which the token fields refuse (finding 2453).
-  secretsOperateDenied?: (() => Promise<ReadonlySet<string> | undefined>) | undefined;
+  secretsOperateDenied?: SecretsOperateDenied | undefined;
 }
 
 type BindingUpdate = { secretBindings?: SecretBindings; changedSecrets?: SecretMetadata[] };
@@ -269,7 +270,12 @@ function renderCard(section: HTMLElement, state: ChannelState, provider: Channel
       provider.secretBindings.some(
         (binding) => !state.drawerContext.secretBindings?.[binding.key]?.source,
       ));
-  const actionAttrs = canOpen ? {} : { disabled: "" };
+  // A disabled action names the reason shown on the card (finding 2495).
+  const reasonId = `channel-${provider.id}-unavailable`;
+  const reasonShown = !state.readOnly && !disabledByMode && (blockReason || !support.supported);
+  const actionAttrs = canOpen
+    ? {}
+    : { disabled: "", ...(reasonShown ? { "aria-describedby": reasonId } : {}) };
   const card = element(
     "section",
     { className: "agent-card channel-card" },
@@ -338,10 +344,12 @@ function renderCard(section: HTMLElement, state: ChannelState, provider: Channel
       ),
     );
   } else if (blockReason) {
-    card.append(element("p", { className: "status", "data-tone": "danger" }, blockReason));
+    card.append(
+      element("p", { className: "status", "data-tone": "danger", id: reasonId }, blockReason),
+    );
   } else if (!support.supported) {
     card.append(
-      element("p", { className: "status", "data-tone": "danger" }, support.reason),
+      element("p", { className: "status", "data-tone": "danger", id: reasonId }, support.reason),
       nativeDocument(`${provider.name} native configuration`, support.config),
     );
   }
@@ -824,12 +832,22 @@ function openDrawer(
     changedSecrets: structuredClone(drawerContext.draftChangedSecrets),
     unresolved: unresolved || state.pending || state.outcomeUnknown,
   });
+  // A save that changes nothing still writes a new Configuration generation and says it saved
+  // (finding 2482), so Save waits for a change, as Channel Secrets does. A provider not yet
+  // configured saves the settings shown, and Create Agent's drawer only stages its settings.
+  const unchanged = () =>
+    !drawerContext.creating && drawerContext.isConfigured && !unsavedChannelDraft(captureDraft());
+  const updateSubmit = () => {
+    submit.disabled = Boolean(stale || unresolved || unchanged());
+  };
+  body.addEventListener("input", updateSubmit);
+  body.addEventListener("change", updateSubmit);
   state.captureDraft = captureDraft;
   state.carriedDraft = null;
   state.drawerContext.drafts?.track("channels", captureDraft);
   state.drawerContext.drafts?.unsavedWhen("channels", unsavedChannelDraft);
+  updateSubmit();
   if (stale || unresolved) {
-    submit.disabled = true;
     feedback.append(
       statusBlock(
         "danger",
@@ -846,7 +864,7 @@ function openDrawer(
   body.append(feedback, element("div", { className: "dialog-actions" }, cancel, submit));
   body.addEventListener("submit", (event) => {
     event.preventDefault();
-    if (state.pending || stale || unresolved) {
+    if (state.pending || stale || unresolved || unchanged()) {
       return;
     }
     if (

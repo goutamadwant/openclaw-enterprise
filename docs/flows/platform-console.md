@@ -1,7 +1,7 @@
 ---
 created: 2026-09-01
-updated: 2026-10-21
-last_updated_session: authoring-run/634a754f-a79e-4aac-94fe-0646caf6a287
+updated: 2026-10-25
+last_updated_session: fix-2505
 ---
 
 # Platform console request flow
@@ -188,6 +188,8 @@ unavailable; selection never becomes an API query selector.
 Namespace checks, naming a known selection; retained-view reads do not extend this.
 `shell.mts:createShell` listens for the 760px mobile breakpoint; widening closes
 the drawer without focusing its hidden toggle and releases `main.inert`.
+Load renders replace the shell; `createShell` activates a control whose mouse
+press a render replaced before release.
 Empty lists show access guidance. `navigation.mts:navigate` returns Agent detail/creation
 to Agents; global pages remain open; recovered warnings disappear.
 
@@ -240,8 +242,8 @@ provisioning, ordinary drafts, Secret grants, and harness authentication.
 ### 4–6. Edit the Agent and access runtime files
 
 [Agent editing](platform-console/agent-editing.md) traces version rendering,
-channels, credentials, and workspace files;
-[stop and deletion](platform-console/agent-stop-and-deletion.md) have their own trace;
+channels and credentials; [workspace files](platform-console/agent-workspace-files.md) and
+[stop and deletion](platform-console/agent-stop-and-deletion.md) have their own traces;
 [Agent sharing](platform-console/agent-sharing.md) traces policy writes.
 
 `channels/slack.mjs:supportSlack` rejects shapes the editor cannot preserve. The

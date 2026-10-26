@@ -1,6 +1,7 @@
 import { assertApiError } from "../helpers/api-error.mjs";
 import { plaintextGatewayComputeDrivers } from "../helpers/plaintext-gateway-compute.mjs";
 import { SlackChannelDriver } from "../../apps/controller/src/drivers/channel/slack.ts";
+import { validateModelCredentialReferences } from "../../apps/controller/src/drivers/configuration/model-auth.ts";
 import { SshComputeDriver } from "../../apps/controller/src/drivers/compute/ssh/index.ts";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
 import assert from "node:assert/strict";
@@ -39,7 +40,7 @@ import { createTestConfigurationDriver } from "../helpers/configuration-driver.m
 import { createReadyComputeDriver } from "../helpers/development.mjs";
 import { jsonLineDestination } from "../helpers/json-lines.mjs";
 import { createTestSecretDriver } from "../helpers/secret-driver.mjs";
-import { AGENT_NAME_CONFLICT } from "../helpers/refusal-text.mjs";
+import { AGENT_NAME_CONFLICT, referenceFormRefusal } from "../helpers/refusal-text.mjs";
 import { createTestKubernetesComputeDriver } from "../helpers/kubernetes-compute.mjs";
 import { createOccLogger } from "../../apps/controller/src/logging.ts";
 import { availablePort } from "../helpers/available-port.mjs";
@@ -8270,6 +8271,158 @@ test("SSH Compute refuses at Agent save and deploy a roster or workspace whose m
   }
 });
 
+test("Agent provisioning and deploy name a refused channel token reference form before Slack validation", async () => {
+  // Finding 2506: provisioning ran the Slack Channel Driver's check before the Configuration rules
+  // Configuration save applies. That check reads only an env SecretRef, so every refused string
+  // form, bound or not, got its generic "Select an environment-backed Secret" answer. These are
+  // the bundled Kubernetes Compute's binding rules (OCC applies them by implementation) and the
+  // Configuration Drivers' credential slot rule, with both Slack tokens bound.
+  const configurationDriver = {
+    ...createProvisioningCapableConfigurationDriver(),
+    validate: async (configuration) => validateModelCredentialReferences(configuration.values),
+  };
+  const controller = await configuredController({
+    computeDriver: {
+      ...createProvisioningCapableComputeDriver(),
+      implementation: "occ/kubernetes",
+    },
+    configurationDriver,
+  });
+  const { fixture } = controller;
+  await bootstrap(controller);
+  const namespace = await createNamespace(controller, "slack-reference-forms");
+  await fixture.controller.handleNamespaceLifecycle(fixture.principal.id, namespace.id, "ready");
+  const base = `/namespaces/${namespace.id}`;
+  const makeSecret = async (name, value) => {
+    const result = await controller.request("POST", `${base}/secrets`, { body: { name, value } });
+    assert.equal(result.status, 201);
+    return result.data;
+  };
+  const app = await makeSecret("app", "xapp-synthetic-app");
+  const bot = await makeSecret("bot", "xoxb-synthetic-bot");
+  const model = await makeSecret("model", "synthetic-model");
+  let calls = 0;
+  const channel = new SlackChannelDriver(async () => {
+    calls++;
+    return new Response(JSON.stringify({ ok: true, bot_id: "B123", team_id: "T123" }));
+  });
+  fixture.controller.registerDriver(channel);
+  fixture.controller.selectDriver("channel", channel.id);
+  const provision = (botToken) =>
+    controller.request("POST", `${base}/agents/provision`, {
+      body: provisioningRequestBody(
+        namespace.id,
+        { modelApiKey: model, toolApiKey: model },
+        {
+          configuration: {
+            kind: "agent",
+            values: {
+              agents: { defaults: { model: "codex/gpt-6-astra" } },
+              channels: {
+                slack: {
+                  enabled: true,
+                  mode: "socket",
+                  appToken: { source: "env", provider: "default", id: "SLACK_APP_TOKEN" },
+                  botToken,
+                },
+              },
+            },
+            secretBindings: {
+              SLACK_APP_TOKEN: { source: app.ref, delivery: { type: "env" } },
+              SLACK_BOT_TOKEN: { source: bot.ref, delivery: { type: "env" } },
+            },
+          },
+        },
+      ),
+    });
+  const setting = (requirement) => `Configuration setting channels.slack.botToken ${requirement}.`;
+  const form = (name) => referenceFormRefusal("channels.slack.botToken", name);
+  const forms = [
+    ["xoxb-${SLACK_BOT_TOKEN}", form("otherText")],
+    // Finding 2517: a token pasted as the value names the setting the same way.
+    ["$xoxbSECRET", form("inline")],
+    // Finding 2503: trailing space and two references are not "text around" a reference.
+    ["${SLACK_BOT_TOKEN} ", form("otherText")],
+    ["${SLACK_BOT_TOKEN}${SLACK_APP_TOKEN}", form("otherText")],
+    ["${SLACK_BOT_TOKEN:-}", form("fallback")],
+    ["$SLACK_BOT_TOKEN", form("shorthand")],
+    [
+      "${slack_bot}",
+      setting(
+        "contains ${slack_bot}, which the runtime does not substitute: use an uppercase ${NAME} bound to a Secret in secretBindings, or escape literal text as $${NAME}",
+      ),
+    ],
+    [
+      "${SLACK_SPARE_TOKEN}",
+      setting(
+        "references SLACK_SPARE_TOKEN without a Configuration Secret binding: bind SLACK_SPARE_TOKEN in secretBindings to an environment-backed Secret, or remove the reference",
+      ),
+    ],
+    // Finding 2520: the binding rule answers before the form rule, at save and at deploy.
+    [
+      "xoxb-${SLACK_SPARE_TOKEN}",
+      setting(
+        "references SLACK_SPARE_TOKEN without a Configuration Secret binding: bind SLACK_SPARE_TOKEN in secretBindings to an environment-backed Secret, or remove the reference",
+      ),
+    ],
+  ];
+  for (const [botToken, message] of forms) {
+    const refused = await provision(botToken);
+    assertApiError(refused, 400, "INVALID_REQUEST");
+    assert.equal(refused.body.error.message, message, botToken);
+    assert.doesNotMatch(JSON.stringify(refused.body), /xoxb-synthetic|SECRET/);
+  }
+  // Each was refused before Slack was asked, and nothing was created.
+  assert.equal(calls, 0);
+  assert.deepEqual(
+    await fixture.platformState.read((view) => view.agents.listAgents(namespace.id)),
+    [],
+  );
+
+  // Finding 2516: deployment also asked the Slack Channel Driver first. A stored Configuration
+  // that predates these rules, written past OCC, now gets the rule's message at deploy, still
+  // before Slack is asked.
+  const values = {
+    agents: { defaults: { model: "codex/gpt-6-astra" } },
+    channels: {
+      slack: {
+        enabled: true,
+        mode: "socket",
+        appToken: { source: "env", provider: "default", id: "SLACK_APP_TOKEN" },
+        botToken: "${SLACK_BOT_TOKEN}",
+      },
+    },
+  };
+  const config = await controller.request("POST", `${base}/configurations`, {
+    body: {
+      kind: "agent",
+      values,
+      secretBindings: {
+        SLACK_APP_TOKEN: { source: app.ref, delivery: { type: "env" } },
+        SLACK_BOT_TOKEN: { source: bot.ref, delivery: { type: "env" } },
+      },
+    },
+  });
+  assert.equal(config.status, 201, JSON.stringify(config.body));
+  const agent = await controller.request("POST", `${base}/agents`, {
+    body: { name: "slack-forms", configurationId: config.data.id },
+  });
+  assert.equal(agent.status, 201, JSON.stringify(agent.body));
+  await bindHarnessKey(fixture, namespace.id, agent.data);
+  for (const [botToken, message] of forms) {
+    const stored = configurationDriver.stored({ namespaceId: namespace.id, id: config.data.id });
+    await configurationDriver.update({
+      ...stored,
+      values: { ...values, channels: { slack: { ...values.channels.slack, botToken } } },
+    });
+    const refused = await controller.request("POST", `${base}/agents/${agent.data.id}/deploy`);
+    assertApiError(refused, 400, "INVALID_REQUEST");
+    assert.equal(refused.body.error.message, message, botToken);
+    assert.doesNotMatch(JSON.stringify(refused.body), /xoxb-synthetic|SECRET/);
+  }
+  assert.equal(calls, 0);
+});
+
 test("Slack validation rejects swapped credentials and preserves authorization", async () => {
   const controller = await configuredController({
     computeDriver: createProvisioningCapableComputeDriver(),
@@ -8468,4 +8621,217 @@ test("Slack validation rejects swapped credentials and preserves authorization",
   const disabled = await provision();
   assert.equal(disabled.body.error.code, "DEPENDENCY_UNAVAILABLE");
   assert.equal(calls, beforeDisabled);
+});
+
+test("Slack validation reads a whole ${NAME} token as the env SecretRef it binds", async () => {
+  const controller = await configuredController({
+    computeDriver: createProvisioningCapableComputeDriver(),
+    configurationDriver: createProvisioningCapableConfigurationDriver(),
+  });
+  const { fixture } = controller;
+  await bootstrap(controller);
+  const namespace = await createNamespace(controller, "slack-whole-reference");
+  await fixture.controller.handleNamespaceLifecycle(fixture.principal.id, namespace.id, "ready");
+  const base = `/namespaces/${namespace.id}`;
+  const makeSecret = async (name, value) => {
+    const result = await controller.request("POST", `${base}/secrets`, { body: { name, value } });
+    assert.equal(result.status, 201);
+    return result.data;
+  };
+  const app = await makeSecret("app", "xapp-synthetic-app");
+  const bot = await makeSecret("bot", "xoxb-synthetic-bot");
+  const model = await makeSecret("model", "synthetic-model");
+  const tokens = [];
+  const channel = new SlackChannelDriver(async (url, options) => {
+    assert.equal(new URL(url).pathname, "/api/auth.test");
+    tokens.push(options.headers.authorization);
+    return new Response(JSON.stringify({ ok: true, bot_id: "B123", team_id: "T123" }));
+  });
+  fixture.controller.registerDriver(channel);
+  fixture.controller.selectDriver("channel", channel.id);
+  // Configuration save accepts the whole-reference form and Edit Slack keeps it; OpenClaw reads
+  // it as the env SecretRef to that name (finding 2511).
+  const configuration = {
+    kind: "agent",
+    values: {
+      channels: {
+        slack: {
+          enabled: true,
+          mode: "socket",
+          appToken: "${SLACK_APP_TOKEN}",
+          botToken: "${SLACK_BOT_TOKEN}",
+        },
+      },
+    },
+    secretBindings: {
+      SLACK_APP_TOKEN: { source: app.ref, delivery: { type: "env" } },
+      SLACK_BOT_TOKEN: { source: bot.ref, delivery: { type: "env" } },
+    },
+  };
+  const provision = (plan) =>
+    controller.request("POST", `${base}/agents/provision`, {
+      body: provisioningRequestBody(
+        namespace.id,
+        { modelApiKey: model, toolApiKey: model },
+        { configuration: plan },
+      ),
+    });
+  // The fixture has no durable work queue: its error means the plan passed channel validation,
+  // which sent the bound bot token to Slack.
+  assert.equal((await provision(configuration)).body.error.code, "DEPENDENCY_UNAVAILABLE");
+  assert.deepEqual(tokens, ["Bearer xoxb-synthetic-bot"]);
+
+  // The name still needs a binding: an unbound one is refused before Slack is called.
+  const unbound = structuredClone(configuration);
+  delete unbound.secretBindings.SLACK_BOT_TOKEN;
+  const refused = await provision(unbound);
+  assertApiError(refused, 400, "CHANNEL_CREDENTIAL_BINDING_REQUIRED");
+  assert.equal(refused.body.error.details[0].path, "/channels/slack/botToken");
+  assert.equal(tokens.length, 1);
+
+  // Deployment of a saved Configuration applies the same rule.
+  const config = await controller.request("POST", `${base}/configurations`, {
+    body: configuration,
+  });
+  assert.equal(config.status, 201, JSON.stringify(config.body));
+  assert.equal(config.data.values.channels.slack.botToken, "${SLACK_BOT_TOKEN}");
+  const agent = await controller.request("POST", `${base}/agents`, {
+    body: { name: "slack-whole-reference", configurationId: config.data.id },
+  });
+  assert.equal(agent.status, 201, JSON.stringify(agent.body));
+  await bindHarnessKey(fixture, namespace.id, agent.data);
+  for (const secret of [app, bot]) {
+    fixture.state.bindings.push({
+      id: `slack-${secret.id}`,
+      namespaceId: namespace.id,
+      subjectKind: "identity",
+      subjectId: agent.data.servicePrincipalId,
+      roleId: `harness-key-${agent.data.id}`,
+      resourceKind: "secret",
+      resourceId: secret.id,
+    });
+  }
+  const deploy = await controller.request("POST", `${base}/agents/${agent.data.id}/deploy`);
+  assert.equal(deploy.status, 202, JSON.stringify(deploy.body));
+  assert.deepEqual(tokens, ["Bearer xoxb-synthetic-bot", "Bearer xoxb-synthetic-bot"]);
+});
+
+test("Slack validation with no Slack proxy names the setting at provision and deploy", async () => {
+  const controller = await configuredController({
+    computeDriver: createProvisioningCapableComputeDriver(),
+    configurationDriver: createProvisioningCapableConfigurationDriver(),
+  });
+  const { fixture } = controller;
+  await bootstrap(controller);
+  const namespace = await createNamespace(controller, "slack-no-route");
+  await fixture.controller.handleNamespaceLifecycle(fixture.principal.id, namespace.id, "ready");
+  const base = `/namespaces/${namespace.id}`;
+  const makeSecret = async (name, value) => {
+    const result = await controller.request("POST", `${base}/secrets`, { body: { name, value } });
+    assert.equal(result.status, 201);
+    return result.data;
+  };
+  const app = await makeSecret("app", "xapp-synthetic-app");
+  const bot = await makeSecret("bot", "xoxb-synthetic-bot");
+  const model = await makeSecret("model", "synthetic-model");
+  // Finding 2521: production composition builds the Driver with expectProxy, since its API
+  // egress is default-deny unless sign-in settings open it. With no proxy URL, a check that gets
+  // no answer from Slack usually means the Installation has no Slack route: a fixed refusal names
+  // the setting, and still allows a retry for an open route that timed out (finding 2531).
+  // The rejection has the shape Node's fetch gives a connection that timed out.
+  const timedOut = () =>
+    new TypeError("fetch failed", {
+      cause: Object.assign(new Error("connect ETIMEDOUT"), { code: "ETIMEDOUT" }),
+    });
+  let calls = 0;
+  let answer = timedOut();
+  const channel = new SlackChannelDriver(
+    async () => {
+      calls++;
+      if (answer instanceof Error) {
+        throw answer;
+      }
+      return answer();
+    },
+    undefined,
+    { expectProxy: true },
+  );
+  fixture.controller.registerDriver(channel);
+  fixture.controller.selectDriver("channel", channel.id);
+  const configuration = {
+    kind: "agent",
+    values: {
+      channels: {
+        slack: {
+          enabled: true,
+          mode: "socket",
+          appToken: "${SLACK_APP_TOKEN}",
+          botToken: "${SLACK_BOT_TOKEN}",
+        },
+      },
+    },
+    secretBindings: {
+      SLACK_APP_TOKEN: { source: app.ref, delivery: { type: "env" } },
+      SLACK_BOT_TOKEN: { source: app.ref, delivery: { type: "env" } },
+    },
+  };
+  const provision = () =>
+    controller.request("POST", `${base}/agents/provision`, {
+      body: provisioningRequestBody(
+        namespace.id,
+        { modelApiKey: model, toolApiKey: model },
+        { configuration },
+      ),
+    });
+  const noRoute =
+    "OCC could not reach Slack, and the API has no Slack proxy. If the API has another approved route to Slack, try again. Otherwise an administrator must set Helm slackProxy.enabled or api.channelDirectoryProxyUrl; see the Slack integration guide.";
+  // Checks that need no provider call keep their own answers: a wrong token role is still named.
+  assertApiError(await provision(), 400, "CHANNEL_CREDENTIAL_ROLE_MISMATCH");
+  assert.equal(calls, 0);
+  configuration.secretBindings.SLACK_BOT_TOKEN.source = bot.ref;
+  const refused = await provision();
+  assertApiError(refused, 409, "RESOURCE_CONFLICT");
+  assert.equal(refused.body.error.message, noRoute);
+  assert.doesNotMatch(JSON.stringify(refused.body), /xoxb-synthetic|xapp-synthetic/);
+  assert.equal(calls, 1);
+  assert.deepEqual(
+    await fixture.platformState.read((view) => view.agents.listAgents(namespace.id)),
+    [],
+  );
+  // An answer from Slack proves a route exists, so its failure stays the transient outage.
+  answer = () => new Response("upstream unavailable", { status: 503 });
+  assertApiError(await provision(), 503, "CHANNEL_CREDENTIAL_UNAVAILABLE");
+  // A route an operator approved instead of the proxy still validates: the fixture has no
+  // durable work queue, so its error means the plan passed channel validation.
+  answer = () => new Response(JSON.stringify({ ok: true, bot_id: "B123", team_id: "T123" }));
+  const before = calls;
+  assertApiError(await provision(), 503, "DEPENDENCY_UNAVAILABLE");
+  // auth.test ran and passed: the 503 comes after validation, not from skipping it.
+  assert.equal(calls, before + 1);
+  answer = timedOut();
+
+  // Deployment of a saved Agent gets the same answer.
+  const config = await controller.request("POST", `${base}/configurations`, {
+    body: configuration,
+  });
+  assert.equal(config.status, 201, JSON.stringify(config.body));
+  const agent = await controller.request("POST", `${base}/agents`, {
+    body: { name: "slack-no-route", configurationId: config.data.id },
+  });
+  assert.equal(agent.status, 201, JSON.stringify(agent.body));
+  await bindHarnessKey(fixture, namespace.id, agent.data);
+  for (const secret of [app, bot]) {
+    fixture.state.bindings.push({
+      id: `slack-${secret.id}`,
+      namespaceId: namespace.id,
+      subjectKind: "identity",
+      subjectId: agent.data.servicePrincipalId,
+      roleId: `harness-key-${agent.data.id}`,
+      resourceKind: "secret",
+      resourceId: secret.id,
+    });
+  }
+  const deploy = await controller.request("POST", `${base}/agents/${agent.data.id}/deploy`);
+  assertApiError(deploy, 409, "RESOURCE_CONFLICT");
+  assert.equal(deploy.body.error.message, noRoute);
 });

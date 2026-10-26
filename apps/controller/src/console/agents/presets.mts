@@ -15,14 +15,22 @@ import {
   requiredPresetVariables,
   validatePresetTemplate,
 } from "../preset-variables.mjs";
-import { message, namespacePath } from "./list.mjs";
-import { SECRET_OPERATE_DENIED } from "./secret-picker.mjs";
+import { message, namespaceListNeed, namespacePath } from "./list.mjs";
+import type { SecretsOperateDenied } from "./credential-access.mjs";
+import {
+  NEW_SECRET_OPERATE_DENIED,
+  NEW_SECRET_OPERATE_REMEDY,
+  SECRET_CREATE_DENIED,
+  SECRET_OPERATE_DENIED,
+} from "./secret-picker.mjs";
 
 type PresetContext = Pick<NamespacePageContext, "request" | "isCurrent" | "onExpired"> & {
   namespaceId: string;
   drafts: ReturnType<ReturnType<typeof createDraftStore>["scope"]>;
   // The readable Secrets the caller may not operate; undefined when the answer is unknown.
-  secretsOperateDenied?: (() => Promise<ReadonlySet<string> | undefined>) | undefined;
+  secretsOperateDenied?: SecretsOperateDenied | undefined;
+  // The Namespace permission answer's secrets.create: undefined when it is unknown.
+  secretsCreateAllowed?: (() => Promise<boolean | undefined>) | undefined;
 };
 
 interface VariableField {
@@ -236,9 +244,10 @@ export function createPresetFields(
     }
     try {
       // The list shows once the operate answer is in, so no denied Secret is ever choosable.
-      const [secrets, operateDenied] = await Promise.all([
+      const [secrets, operateDenied, createAllowed] = await Promise.all([
         context.request(`${namespacePath(context.namespaceId)}/secrets`),
         (context.secretsOperateDenied?.() ?? Promise.resolve(undefined)).catch(() => undefined),
+        (context.secretsCreateAllowed?.() ?? Promise.resolve(undefined)).catch(() => undefined),
       ]);
       if (!context.isCurrent() || !section.isConnected || version !== loadVersion) {
         return;
@@ -258,9 +267,42 @@ export function createPresetFields(
         const restored = field.restoredSecret ?? "";
         field.secretSelect.value = field.operateDenied.has(restored) ? "" : restored;
         field.restoredSecret = undefined;
-        field.secretStatus.textContent = field.secrets.length
-          ? "Existing Secrets in this Namespace are available. Secret values are never shown."
-          : "No existing Secrets are available in this Namespace. Create a new Secret instead.";
+        // Without Secret create, the create-new source is listed disabled with the reason and
+        // the field binds an existing Secret, as the other Secret fields do (finding 2483). So it
+        // is when operate is denied on any readable Secret: operate is then granted per Secret,
+        // and a new Secret has none, so Agent create would refuse it once saved (finding 2492).
+        const createDenied = createAllowed === false;
+        const newSecretDenied = createDenied
+          ? SECRET_CREATE_DENIED
+          : field.operateDenied.size
+            ? NEW_SECRET_OPERATE_DENIED
+            : undefined;
+        const createOption = field.mode.querySelector<HTMLOptionElement>(
+          `option[value="${NEW_SECRET}"]`,
+        );
+        if (createOption) {
+          createOption.disabled = newSecretDenied !== undefined;
+          createOption.textContent = newSecretDenied
+            ? `Create new Secret (${newSecretDenied})`
+            : "Create new Secret";
+        }
+        // Per-Secret operate also names the grant that would let an Agent use a new Secret.
+        const newSecretHint =
+          newSecretDenied === NEW_SECRET_OPERATE_DENIED
+            ? `${newSecretDenied} ${NEW_SECRET_OPERATE_REMEDY}`
+            : newSecretDenied;
+        if (newSecretDenied && field.mode.value === NEW_SECRET) {
+          field.mode.value = EXISTING_SECRET;
+          field.input.dataset.supplied = "false";
+        }
+        field.secretStatus.textContent =
+          createDenied && !field.secrets.length
+            ? `No Secrets you can read in this Namespace. ${SECRET_CREATE_DENIED} Ask an administrator for read access to an existing one.`
+            : newSecretDenied
+              ? `Choose an existing Secret. ${newSecretHint}`
+              : field.secrets.length
+                ? "Existing Secrets in this Namespace are available. Secret values are never shown."
+                : "No existing Secrets are available in this Namespace. Create a new Secret instead.";
         updatePasswordField(field);
       }
     } catch (error) {
@@ -277,7 +319,7 @@ export function createPresetFields(
         field.secretSelect.replaceChildren(
           element("option", { value: "" }, "Existing Secrets unavailable"),
         );
-        field.secretStatus.textContent = `Existing Secrets unavailable. ${message(error)} Choose create-new mode to enter a new token.`;
+        field.secretStatus.textContent = `Existing Secrets unavailable. ${message(error, false, namespaceListNeed("Secrets"))} Choose create-new mode to enter a new token.`;
         updatePasswordField(field);
       }
     }
@@ -609,7 +651,7 @@ export function createPresetFields(
       if (requestFailure(error).status === 401) {
         context.onExpired();
       } else {
-        status.textContent = `Presets unavailable. ${message(error)} Try again or ask an administrator to check Preset access.`;
+        status.textContent = `Presets unavailable. ${message(error, false, namespaceListNeed("Presets"))}`;
       }
     });
   return { section, startDefault, defaultHint };

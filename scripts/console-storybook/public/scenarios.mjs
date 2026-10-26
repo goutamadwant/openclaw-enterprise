@@ -1703,6 +1703,7 @@ export const scenarios = {
       "The Namespace permission answer denies Secret creation. The API key Secret field still lists Create new Secret..., disabled with the reason, and its hint says to choose an existing Secret.",
     steps: [
       "Type a name no Secret has in API key Secret. Create new Secret... is listed with the access note under it and opens nothing.",
+      "Open Configure Slack. Its hints say to choose existing Slack token Secrets, with no offer to create them.",
     ],
     gap: "The permission answer is simulated; the API still authorizes Secret creation.",
   },
@@ -1718,9 +1719,10 @@ export const scenarios = {
     ],
     secretOperateDenied: ["sec_demo_slack_backup_token"],
     description:
-      "The Namespace Secret answer lists the Slack backup token as readable but not operable for this member. Each Create Agent Secret field lists it disabled with the reason and never stages it, since Agent create would refuse it.",
+      "The Namespace Secret answer lists the Slack backup token as readable but not operable for this member. Each Create Agent Secret field lists it disabled with the reason and never stages it, since Agent create would refuse it. Secret operate is then granted per Secret, so a new Secret would have none: each field lists Create new Secret... disabled with the reason, and the drawer hints offer only existing Secrets.",
     steps: [
       "Type backup in Slack bot token. Slack backup token (simulated) is listed with the access note under it; choosing it stages nothing.",
+      "Type a name no Secret has in Slack bot token. Create new Secret... is listed with the access note under it and opens nothing; the drawer hints say to choose existing Slack token Secrets.",
       "Close the drawer and type backup in API key Secret: the same option is listed the same way.",
     ],
     gap: "The Secret answer is simulated; the API still authorizes Agent create and the Secrets it binds.",
@@ -3365,6 +3367,21 @@ export const scenarios = {
       "Create Agent saves a same-Namespace Secret before provisioning.",
     ],
     gap: "All credentials and API responses in this preview are simulated.",
+  },
+  createPasswordPresetOperateSome: {
+    group: "Pages/Create Agent",
+    name: "Standard Codex, Secret operate on some Secrets",
+    path: create,
+    standardCodexPreset: true,
+    secretOperateDenied: ["sec_demo_slack_backup_token"],
+    actions: [{ selector: "#agent-preset", value: "pre_00000000-0000-4000-8000-000000000001" }],
+    description:
+      "The Namespace Secret answer lists the Slack backup token as readable but not operable, so this member's Secret operate is granted per Secret and a new Secret would have none. Secret source lists Create new Secret disabled with the reason and starts on Use existing Secret, which lists the backup token disabled too.",
+    steps: [
+      "Open Secret source for Model Secret: Create new Secret is disabled, and the hint under the existing Secret list gives the reason.",
+      "Choose another Secret and select Use Preset: the form opens with that Secret bound.",
+    ],
+    gap: "The Secret answer is simulated; the API still authorizes Agent create and the Secrets it binds.",
   },
   createPasswordPresetMissingModel: {
     group: "Pages/Create Agent",
@@ -7022,10 +7039,11 @@ export const scenarios = {
     slack: true,
     secretOperateDenied: ["sec_demo_slack_backup_token"],
     description:
-      "The Secret answer lists the Slack backup token as readable but not operable for this editor. Each Secret field lists it disabled with the reason and never stages it, since a save that binds it would be refused.",
+      "The Secret answer lists the Slack backup token as readable but not operable for this editor. Each Secret field lists it disabled with the reason and never stages it, since a save that binds it would be refused. Secret operate is then granted per Secret, so each field lists Create new Secret... disabled with the reason too.",
     steps: [
       "Type backup in Slack bot token. Slack backup token (simulated) is listed with the access note under it; choosing it stages nothing and Save channel Secrets stays disabled.",
       "Type backup in API key Secret: the same option is listed the same way.",
+      "Type a name no Secret has in API key Secret. Create new Secret... is listed with the access note under it and opens nothing.",
     ],
     gap: "The Secret answer is simulated; the API still authorizes every save and the Secrets it binds.",
   },

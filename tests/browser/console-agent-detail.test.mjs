@@ -13,6 +13,7 @@ import {
   accessBindingPostRequests,
   AGENT_READ,
   apiRequests,
+  deniedCreateSecretOption,
   detailUrl,
   expectNoText,
   expireSessions,
@@ -70,9 +71,13 @@ import {
   AGENT_SAVE_DENIED,
   CONFIGURATION_EDITS_PENDING,
   CONFIGURATION_SAVE_DENIED,
+  NEW_SECRET_OPERATE_DENIED,
+  NEW_SECRET_OPERATE_REMEDY,
   READ_UNAVAILABLE,
   SAVED_CONFIGURATION_CHANGED,
+  SECRET_OPERATE_DENIED,
   WORKSPACE_FILES_UNAVAILABLE,
+  namespaceListDenied,
   secretOperateRefused,
 } from "../helpers/refusal-text.mjs";
 
@@ -1949,8 +1954,13 @@ test("Agent credentials choose existing Secrets for harness authentication", asy
     await route.fulfill({ status: 403, contentType: "application/json", body: "{}" });
   });
   await page.reload();
-  await page.getByText(/Secrets unavailable/).waitFor();
-  assert.deepEqual(await statusTone(page.getByText(/Secrets unavailable/)), {
+  // A refused Secret list names the Namespace read it checks, not a bare "Access denied".
+  const unavailableSecrets = page.getByText(
+    `Secrets unavailable. ${namespaceListDenied("Secrets")}`,
+    { exact: true },
+  );
+  await unavailableSecrets.waitFor();
+  assert.deepEqual(await statusTone(unavailableSecrets), {
     className: "status",
     tone: "danger",
     role: "alert",
@@ -4825,6 +4835,129 @@ test("Secret fields refuse a readable Secret the editor cannot operate", async (
     await alert.getByText(secretOperateRefused(other.name), { exact: false }).count(),
     0,
   );
+});
+
+// An Agent whose harness key is bound, and a member with every write except Secret operate, which
+// it holds on the bound key only. `withSpare` adds a readable Secret the member may not operate.
+async function boundKeyMemberSetup(t, name, { withSpare = false } = {}) {
+  const slug = name.toLowerCase().replaceAll(" ", "-");
+  const fixture = await createConsoleAppFixture(t);
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace(name, { ready: true });
+  const bound = await fixture.createSecret(namespace.id, "Bound harness key", "sk-bound-value");
+  const spare = withSpare
+    ? await fixture.createSecret(namespace.id, "Spare key", "sk-spare-value")
+    : undefined;
+  const agent = await fixture.createAgent(
+    namespace.id,
+    `${name} Agent`,
+    nativeValues(slug, { harnessId: "codex" }),
+    { harnessAuth: { method: "api_key", source: bound.ref }, executionMode: "dedicated" },
+  );
+  const member = await fixture.createNamespaceMember(
+    `${slug}-member`,
+    namespace.id,
+    MEMBER_WRITE.filter(([action, kind]) => !(action === "operate" && kind === "secret")),
+  );
+  grantSecretOperate(fixture, namespace.id, member.principal, [bound.id]);
+  return { fixture, namespace, bound, spare, agent, member };
+}
+
+// Creating a Secret does not grant operate on it. The picker read the operate answer when its list
+// opened, before the Secret existed, so a member who may create and read Secrets but operate only
+// the bound one saw the new Secret staged and the save refused with an audited 403 (finding 2486).
+// After an inline create the picker reads the answer again and refuses the new Secret in place.
+test("a Secret created inline that the member cannot operate is not staged", async (t) => {
+  // Operate covers every readable Secret, so the answer is empty until the new Secret exists.
+  const { fixture, namespace, bound, agent, member } = await boundKeyMemberSetup(
+    t,
+    "Inline operate",
+  );
+  const path = `/namespaces/${namespace.id}/agents/${agent.id}`;
+  const { page } = await newPage(t, fixture);
+  const requests = apiRequests(page, fixture.origin);
+  const answers = [];
+  page.on("response", (response) => {
+    if (response.url() === `${fixture.origin}${path}/permissions/secrets`) {
+      answers.push(response.status());
+    }
+  });
+  await login(
+    page,
+    fixture,
+    detailUrl(fixture, namespace.id, agent.id, "draft", "credentials"),
+    member.credentials,
+  );
+  const picker = page.getByLabel("API key Secret", { exact: true });
+  await waitForInputValue(picker, bound.name);
+  await waitForEnabled(picker);
+  await picker.fill("no matching Secret");
+  await page.getByRole("option", { name: "Create new Secret...", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Create harness authentication Secret" });
+  await dialog.getByLabel("Name", { exact: true }).fill("Inline new key");
+  await dialog.getByLabel("Value", { exact: true }).fill("sk-inline-new-value");
+  await dialog.getByRole("button", { name: "Create Secret", exact: true }).click();
+  await dialog.waitFor({ state: "detached" });
+  // The Secret exists, but the field keeps the bound Secret and names why the new one is refused.
+  await page
+    .getByText(`Inline new key cannot be chosen. ${SECRET_OPERATE_DENIED}`, { exact: true })
+    .waitFor();
+  assert.equal(await picker.inputValue(), bound.name);
+  assert.equal(await page.getByText("Secret binding staged. Save changes to apply it.").count(), 0);
+  // The answer was read once when the list opened and again after the create.
+  assert.deepEqual(answers, [200, 200]);
+  // The new Secret is listed disabled with the reason.
+  const created = (await fixture.request("GET", `/namespaces/${namespace.id}/secrets`)).data.find(
+    (secret) => secret.name === "Inline new key",
+  );
+  assert.ok(created);
+  await operateDeniedSecretOption(page, "API key Secret", created);
+  await picker.press("Escape");
+  // The only write is the Secret create: no save was sent, so no denial was audited.
+  assert.deepEqual(
+    nonAuthWriteRequests(requests).map(
+      ({ method, path: requestPath }) => `${method} ${requestPath}`,
+    ),
+    [`POST /namespaces/${namespace.id}/secrets`],
+  );
+});
+
+// A member denied operate on a readable Secret holds Secret operate per Secret, so a Secret it
+// creates gets none. The picker offered Create new Secret anyway: the Secret was saved, then
+// refused as a choice and left unused (finding 2500). The action is listed disabled with the
+// reason the Preset's Create new Secret choice gives, before anything is created.
+test("the picker's Create new Secret is disabled when operate covers only some Secrets", async (t) => {
+  const { fixture, namespace, bound, spare, agent, member } = await boundKeyMemberSetup(
+    t,
+    "Operate some",
+    { withSpare: true },
+  );
+  const { page } = await newPage(t, fixture);
+  const requests = apiRequests(page, fixture.origin);
+  await login(
+    page,
+    fixture,
+    detailUrl(fixture, namespace.id, agent.id, "draft", "credentials"),
+    member.credentials,
+  );
+  const picker = page.getByLabel("API key Secret", { exact: true });
+  await waitForInputValue(picker, bound.name);
+  await waitForEnabled(picker);
+  await operateDeniedSecretOption(page, "API key Secret", spare);
+  const create = await deniedCreateSecretOption(page, "API key Secret", NEW_SECRET_OPERATE_DENIED);
+  // A forced click skips the disabled check: choosing the action still opens nothing.
+  await create.click({ force: true });
+  assert.equal(await page.getByRole("dialog").count(), 0);
+  await picker.press("Escape");
+  // The hint names the grant an administrator can give: operate on one Secret (finding 2507).
+  await page
+    .getByText(
+      `Choose an existing Secret. ${NEW_SECRET_OPERATE_DENIED} ${NEW_SECRET_OPERATE_REMEDY}`,
+      { exact: true },
+    )
+    .waitFor();
+  assert.equal(await picker.inputValue(), bound.name);
+  assert.deepEqual(nonAuthWriteRequests(requests), []);
 });
 
 // A tab parked before the answer landed is shown again with the answer applied (finding 2421).

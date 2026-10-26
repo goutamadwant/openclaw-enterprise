@@ -10,7 +10,6 @@ import type {
   InstallationCapabilities,
   Namespace,
   NamespaceCallerPermissionsResponse,
-  NamespaceSecretPermissionsResponse,
   PluginApprovers,
   PresetLaunchSettings,
   SecretBindings,
@@ -37,8 +36,13 @@ import { WORKSPACE_DEFAULTS, WORKSPACE_DEFAULTS_ID } from "../workspace-defaults
 import { configuredHarnessId, harnessAuthDescription } from "./harness-auth.mjs";
 import { type DeviceLogin, createDeviceLogin } from "./device-login.mjs";
 import { createRepositoryFields } from "./repositories.mjs";
-import { ensureCredentialOperateBinding } from "./credential-access.mjs";
-import { createSecretReferenceField, secretMetadata } from "./secret-picker.mjs";
+import { ensureCredentialOperateBinding, secretOperateAnswer } from "./credential-access.mjs";
+import {
+  createSecretReferenceField,
+  NEW_SECRET_OPERATE_DENIED,
+  NEW_SECRET_OPERATE_REMEDY,
+  secretMetadata,
+} from "./secret-picker.mjs";
 import { workspaceFileProblem } from "./workspace.mjs";
 import { namespaceNameProblem } from "../namespaces.mjs";
 import { createPresetFields } from "./presets.mjs";
@@ -47,6 +51,8 @@ import { createPluginDiscovery } from "./plugin-discovery.mjs";
 import { createSlackApproverField } from "./slack-approvers.mjs";
 import { renderChannels } from "../channels.mjs";
 import {
+  administratorMessage,
+  AGENT_CREATE_DENIED,
   type AgentNavigation,
   channelBindingRefusal,
   GENERIC_CONFLICT,
@@ -63,7 +69,6 @@ import {
 type ApplyPreset = Parameters<typeof createPresetFields>[1];
 type PresetOptions = Partial<Parameters<ApplyPreset>[1]>;
 type Permissions = Static<typeof NamespaceCallerPermissionsResponse>["data"];
-type SecretPermissions = Static<typeof NamespaceSecretPermissionsResponse>["data"];
 type CreateRequest = (
   path: string,
   options?: RequestOptions & { revalidate?: false; rereadOnResume?: true; readOnly?: true },
@@ -626,7 +631,7 @@ export function renderCreateAgent(context: CreateAgentContext, restored?: unknow
   const notReady = createNamespaceState(context);
   const unavailable =
     context.permissions?.agents?.create === false
-      ? "Your access does not include creating Agents in this Namespace. Ask an administrator for access, or choose another Namespace."
+      ? AGENT_CREATE_DENIED
       : notReady?.blocked
         ? notReady.note
         : null;
@@ -649,7 +654,7 @@ export function renderCreateAgent(context: CreateAgentContext, restored?: unknow
   }
   // Starting the form replaces the launch view, and with it the control that started it. Give
   // focus to the page heading instead of dropping it to the document (finding 1446).
-  const operateAnswer = secretOperateAnswer(context);
+  const operateAnswer = namespaceSecretOperateAnswer(context);
   const startForm = (
     rendered: PresetLaunchSettings,
     options: PresetOptions,
@@ -717,27 +722,22 @@ const PERMISSIONS_UNREAD =
 // (SAVE_REFUSALS): one fixed text for every 403 (finding 2111).
 const CONFIGURATION_CREATE_REFUSAL =
   "You do not have permission to create this Agent's Configuration. Ask an administrator for Configuration create access in this Namespace, plus Secret operate on each Secret it binds.";
+// This form saves Secret bindings only from its Slack channel settings. A channel refusal that
+// asks for a binding gets where to add one, as on the Agent page (findings 2494, 2506).
+const CHANNEL_BINDING_FORM_REMEDY =
+  "On this form, the Slack channel settings bind SLACK_APP_TOKEN and SLACK_BOT_TOKEN to the Secrets you select there; bind other names through the Configuration API after the Agent exists.";
+// A typed model key is saved as a new Secret, which Agent create then binds (finding 2492).
+const NEW_SECRET_REFUSAL = `${NEW_SECRET_OPERATE_DENIED} Select Start over and use an existing Secret. ${NEW_SECRET_OPERATE_REMEDY}`;
 
 // The readable Secrets this caller may not operate: each Create Agent Secret field, the Preset's
 // existing Secret included, lists them disabled and never stages one, since Agent create, or a
 // directory search, would answer 403 (finding 2469). Read when a field first needs it, and again
-// after a permission reread or a refused create. A failed read is unknown and marks none.
-function secretOperateAnswer(context: CreateAgentContext) {
-  let answer: Promise<ReadonlySet<string> | undefined> | null = null;
-  return {
-    read: () =>
-      (answer ??= (
-        context.request(
-          `${namespacePath(context.namespaceId)}/permissions/secrets`,
-        ) as Promise<SecretPermissions>
-      ).then(
-        (value) => (Array.isArray(value?.operateDenied) ? new Set(value.operateDenied) : undefined),
-        () => undefined,
-      )),
-    reset: () => {
-      answer = null;
-    },
-  };
+// after a permission reread, a refused create or an inline Secret create. A failed read keeps the
+// last answer; before any answer it marks none.
+function namespaceSecretOperateAnswer(context: CreateAgentContext) {
+  return secretOperateAnswer(() =>
+    context.request(`${namespacePath(context.namespaceId)}/permissions/secrets`),
+  );
 }
 
 // What Create Agent knows of its Namespace: missing from a list the form read (kept for Start
@@ -768,7 +768,7 @@ function renderAgentForm(
   rendered: PresetLaunchSettings,
   presetOptions: PresetOptions = {},
   draft: Partial<CreateAgentDraft> = {},
-  operateAnswer = secretOperateAnswer(context),
+  operateAnswer = namespaceSecretOperateAnswer(context),
 ) {
   const { view, request, namespaceId } = context;
   const secretsOperateDenied = operateAnswer.read;
@@ -2450,12 +2450,20 @@ function renderAgentForm(
       }
     }
   }
-  // The Configuration JSON holds the refused channel reference; channel settings bind its Secret.
+  // The Configuration JSON holds the refused channel reference, so the refusal shows once, under
+  // it, and the caller moves focus there once the form is editable again (finding 2506). Returns
+  // whether it did.
   function showChannelBindingRefusal(cause: unknown) {
     const refusal = channelBindingRefusal(cause);
-    if (refusal !== undefined) {
-      configurationError.show(refusal);
+    if (refusal === undefined) {
+      return false;
     }
+    configurationError.show(
+      refusal.includes(" in secretBindings")
+        ? `${refusal} ${CHANNEL_BINDING_FORM_REMEDY}`
+        : refusal,
+    );
+    return true;
   }
   const credentialSourceRefused = () =>
     credentialSourceTypes !== undefined &&
@@ -2998,6 +3006,7 @@ function renderAgentForm(
     updateControls();
     feedback.textContent = "";
     let mutationStarted = false;
+    let refusedInConfiguration = false;
     try {
       mutationStarted = true;
       const finishing = finishProvisioningAttempt({
@@ -3087,13 +3096,15 @@ function renderAgentForm(
           savedStatus.textContent = "";
         }
       }
+      // Admission's channel reference refusal names the Configuration JSON's setting.
+      refusedInConfiguration = !terminal && !outcomeUnknown && showChannelBindingRefusal(cause);
       if (terminal?.stopped) {
         // Not an error: keep the guidance out of the error colour. Later messages replace the span.
         feedback.replaceChildren(
           element("span", { className: "provisioning-stopped" }, feedbackText),
         );
       } else {
-        feedback.textContent = feedbackText;
+        feedback.textContent = refusedInConfiguration ? "" : feedbackText;
       }
       if (terminal?.job.revisionId && terminal.job.agentId) {
         feedback.append(
@@ -3138,6 +3149,9 @@ function renderAgentForm(
       if (context.isCurrent()) {
         pending = false;
         updateControls();
+        if (refusedInConfiguration) {
+          focusConfiguration();
+        }
       }
     }
   }
@@ -3292,6 +3306,26 @@ function renderAgentForm(
     createPending = true;
     updateControls();
     feedback.textContent = "";
+    // A typed key becomes a new Secret that the next requests bind. It gets no Secret operate
+    // grant of its own, so where operate is denied on a readable Secret (granted per Secret)
+    // they would refuse it after the Secret and Configuration were saved: refuse it first, as
+    // the Preset's Create new Secret choice does (finding 2492). The answer is read fresh, so a
+    // retry after an administrator's grant goes on.
+    if (
+      passwordAuth &&
+      !usesOAuth &&
+      !savedSecret &&
+      (await secretsOperateDenied({ fresh: true }))?.size
+    ) {
+      endCreate();
+      if (context.isCurrent()) {
+        feedback.textContent = NEW_SECRET_REFUSAL;
+        focusFeedbackLine(feedback);
+      }
+      pending = false;
+      updateControls();
+      return;
+    }
     // Before anything is saved, ask the API whether Agent create would refuse these plugin
     // selections or initial workspace files with this Configuration. A refusal then leaves the
     // whole form editable, the Configuration included, instead of a saved Configuration this
@@ -3332,6 +3366,7 @@ function renderAgentForm(
           return;
         }
         const failure = requestFailure(error);
+        let refusedInConfiguration = false;
         if (failure.status === 401) {
           context.onExpired();
         } else {
@@ -3342,9 +3377,10 @@ function renderAgentForm(
               : nameTaken
                 ? AGENT_NAME_CONFLICT
                 : followableRefusal(rejectionMessage(error));
-          feedback.textContent =
-            detail + (failure.requestId ? ` Request ID: ${failure.requestId}` : "");
-          showChannelBindingRefusal(error);
+          refusedInConfiguration = showChannelBindingRefusal(error);
+          feedback.textContent = refusedInConfiguration
+            ? ""
+            : detail + (failure.requestId ? ` Request ID: ${failure.requestId}` : "");
           // While the pressed control is still disabled, as after a save.
           focusFeedbackLine(feedback);
           if (nameTaken) {
@@ -3353,6 +3389,9 @@ function renderAgentForm(
         }
         pending = false;
         updateControls();
+        if (refusedInConfiguration) {
+          focusConfiguration();
+        }
         return;
       }
       if (!context.isCurrent()) {
@@ -3363,6 +3402,7 @@ function renderAgentForm(
     context.setDraftCapture(null);
     let mutationStarted = false;
     let creatingSecret = false;
+    let refusedInConfiguration = false;
     try {
       if (passwordAuth && !usesOAuth && !savedSecret) {
         mutationStarted = true;
@@ -3611,10 +3651,12 @@ function renderAgentForm(
         return;
       }
       const registrationProblem = error.status && error.status >= 400 ? ` ${message(cause)}` : "";
+      // A refused grant on a saved Agent shows this text only to an Installation administrator (a
+      // member sees MEMBER_GRANT_REFUSED below), so its denial names nobody to ask (finding 2113).
       const detail = credentialRegistration
         ? `Credential Source registration could not be confirmed.${registrationProblem} Check credential registration before retrying; the selected Secret remains saved.`
         : savedAgent
-          ? `The Agent was created, but credential access is not confirmed. ${message(cause)} Retry credential access, or open the saved Agent and ask an administrator to check access to its saved model and channel Secrets.`
+          ? `The Agent was created, but credential access is not confirmed. ${administratorMessage(cause)} Retry credential access, or open the saved Agent and ask an administrator to check access to its saved model and channel Secrets.`
           : error.status === 409 && creatingSecret && error.code !== "NAMESPACE_NOT_READY"
             ? `A Secret named "${body.name}" already exists in this Namespace, possibly from an earlier Agent with this name. Choose another Agent name, delete that Secret, or select Start over, choose the Preset again, and set its Secret source to Use existing Secret.`
             : error.status === 409 && savedConfiguration && error.code !== "NAMESPACE_NOT_READY"
@@ -3658,13 +3700,12 @@ function renderAgentForm(
         capabilitiesUnreadable &&
         error.status === 403;
       credentialGrantRefused ||= memberGrantRefused;
-      feedback.textContent =
-        (memberGrantRefused ? MEMBER_GRANT_REFUSED : detail) +
-        guidance +
-        (error.requestId ? ` Request ID: ${error.requestId}` : "");
-      if (!savedConfiguration) {
-        showChannelBindingRefusal(cause);
-      }
+      refusedInConfiguration = !savedConfiguration && showChannelBindingRefusal(cause);
+      feedback.textContent = refusedInConfiguration
+        ? ""
+        : (memberGrantRefused ? MEMBER_GRANT_REFUSED : detail) +
+          guidance +
+          (error.requestId ? ` Request ID: ${error.requestId}` : "");
       focusFeedbackLine(feedback);
       // A create that raced another Agent to the name (the preflight checked it).
       if (!savedAgent && error.status === 409 && error.serverMessage === AGENT_NAME_CONFLICT) {
@@ -3680,6 +3721,9 @@ function renderAgentForm(
           renderChannelEditor();
         }
         updateControls();
+        if (refusedInConfiguration) {
+          focusConfiguration();
+        }
       }
     }
   });

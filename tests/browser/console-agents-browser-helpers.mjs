@@ -37,6 +37,20 @@ export const MEMBER_WRITE = [
   ["read", "preset"],
 ];
 
+/**
+ * MEMBER_WRITE without each [action, resourceKind] grant in `grants`, which it must hold: the
+ * member-write persona missing exactly those grants.
+ * @param {...(typeof MEMBER_WRITE)[number]} grants
+ * @returns {typeof MEMBER_WRITE}
+ */
+export function memberWriteWithout(...grants) {
+  const held = ([action, resourceKind]) =>
+    grants.some((grant) => grant[0] === action && grant[1] === resourceKind);
+  const kept = MEMBER_WRITE.filter((grant) => !held(grant));
+  assert.equal(kept.length, MEMBER_WRITE.length - grants.length, "MEMBER_WRITE holds each grant");
+  return kept;
+}
+
 // What a member who reads an Agent holds in one Namespace: the Namespace, the Agent, its
 // versions and its Configuration. Tests add the grants their persona needs to it.
 /** @type {typeof MEMBER_WRITE} */
@@ -66,8 +80,22 @@ export function grantMember(fixture, label, grants) {
  * Removes one [action, resourceKind] grant from member `label`'s Role, which must hold it.
  * Returns a function that restores the grants the Role held before.
  */
-export function revokeMemberGrant(fixture, label, [action, resourceKind]) {
-  const role = memberRole(fixture, label);
+export function revokeMemberGrant(fixture, label, grant) {
+  return revokeRoleGrant(memberRole(fixture, label), label, grant);
+}
+
+/**
+ * Removes one [action, resourceKind] grant from the Installation administrator Role the fixture
+ * seeds for its administrator account, which `login` signs in by default. Returns a restore
+ * function, as revokeMemberGrant does.
+ */
+export function revokeAdministratorGrant(fixture, grant) {
+  const role = fixture.policy.roles.find(({ name }) => name === "Installation administrator");
+  assert.ok(role, "the fixture's administrator has a Role");
+  return revokeRoleGrant(role, "the administrator", grant);
+}
+
+function revokeRoleGrant(role, holder, [action, resourceKind]) {
   const before = role.permissions;
   role.permissions = before.filter(
     (grant) => grant.action !== action || grant.resourceKind !== resourceKind,
@@ -75,7 +103,7 @@ export function revokeMemberGrant(fixture, label, [action, resourceKind]) {
   assert.notEqual(
     role.permissions.length,
     before.length,
-    `${label} holds ${action} ${resourceKind}`,
+    `${holder} holds ${action} ${resourceKind}`,
   );
   return () => {
     role.permissions = before;
@@ -424,6 +452,19 @@ export async function operateDeniedSecretOption(scope, label, secret) {
   await scope.getByLabel(label, { exact: true }).fill(secret.name);
   const option = scope.getByRole("option", {
     name: `${secretOptionLabel(secret)} ${SECRET_OPERATE_DENIED}`,
+    exact: true,
+  });
+  await option.waitFor();
+  assert.equal(await option.getAttribute("aria-disabled"), "true");
+  return option;
+}
+
+// Lists the Secret field `label`'s inline Create new Secret action and returns it, checking that
+// it is disabled with `reason` in its accessible name.
+export async function deniedCreateSecretOption(scope, label, reason) {
+  await scope.getByLabel(label, { exact: true }).fill("no matching Secret");
+  const option = scope.getByRole("option", {
+    name: `Create new Secret... ${reason}`,
     exact: true,
   });
   await option.waitFor();

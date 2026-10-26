@@ -6,7 +6,6 @@ import type {
   AgentRead,
   AgentRevision,
   AgentRevisionRead,
-  AgentSecretPermissionsResponse,
   Configuration,
   HarnessAuthBinding,
   OpenClawConfigurationDocument,
@@ -67,6 +66,8 @@ import {
   neutralDeploymentOutcome,
   outcomeLabel,
   preAdmissionRefusal,
+  askInstallationAdministrator,
+  type AccessNeed,
 } from "./list.mjs";
 import {
   type CarriedChannelSecrets,
@@ -86,9 +87,9 @@ import {
   channelCredentialBlockReason,
 } from "./credentials.mjs";
 import {
-  askInstallationAdministrator,
   credentialOperateGrants,
   ensureCredentialOperateBinding,
+  secretOperateAnswer,
 } from "./credential-access.mjs";
 import {
   createDeploymentStatusPanel,
@@ -100,7 +101,6 @@ import { createDeploymentRecovery } from "./deployment-recovery.mjs";
 
 type DetailContext = ConsolePageContext & { namespaceId: string; agentId: string };
 type Permissions = Static<typeof AgentCallerPermissionsResponse>["data"];
-type SecretPermissions = Static<typeof AgentSecretPermissionsResponse>["data"];
 type RevisionPage = Awaited<ReturnType<typeof readRevisionPage>>;
 type Revision = RevisionPage["revisions"][number];
 type RevisionResult = PromiseSettledResult<RevisionPage>;
@@ -270,6 +270,12 @@ function harnessCredential(binding: HarnessAuthBinding | null | undefined, names
       : null;
 }
 
+// The draft is the Agent's Configuration: an Agent reader without Configuration read is refused it.
+const DRAFT_CONFIGURATION_NEED: AccessNeed = {
+  task: "Reading this Agent's draft Configuration",
+  grant: "Configuration read",
+};
+
 function errorPanel(
   cause: unknown,
   context: DetailContext,
@@ -300,7 +306,7 @@ function errorPanel(
       {},
       versionDenied
         ? "Your access to this Agent does not include this version, so its configuration and deployment outcome are hidden. Ask an Agent administrator for read access to it."
-        : message(cause),
+        : message(cause, false, DRAFT_CONFIGURATION_NEED),
     ),
     responseFields(cause).remembered === true
       ? element(
@@ -351,6 +357,10 @@ const CONFIGURATION_SECRETS_READ_ONLY =
 // A save's reread or its PATCH found a newer Configuration generation than the page's.
 const CONFIGURATION_CHANGED =
   "The saved Configuration changed while you were editing. Reload this draft before saving.";
+// The Configuration JSON saves no Secret bindings; a channel refusal that asks for one gets where
+// the console binds Slack's standard names (finding 2494). The API keeps its secretBindings text.
+const CHANNEL_BINDING_CONSOLE_REMEDY =
+  "This editor does not save Secret bindings: bind SLACK_APP_TOKEN and SLACK_BOT_TOKEN on the Credentials tab or in the Slack editor on the Channels tab, and other names through the Configuration API.";
 
 // Longest wait for Deployment activity's first read before the sections below it show. On a
 // slow link that read lands over a second after the page, and a failed version's banner then
@@ -571,16 +581,10 @@ export async function renderAgentDetail(
   }
   // The readable Secrets this caller may not operate: each Secret field lists them disabled and
   // never stages one, since the save would answer 403 (finding 2453). Read when a field first
-  // needs it, and again after a permission reread. A failed read is unknown and marks none.
-  let secretsOperateRead: Promise<ReadonlySet<string> | undefined> | null = null;
-  const secretsOperateDenied = () =>
-    (secretsOperateRead ??= (
-      request(`${path}/permissions/secrets`) as Promise<SecretPermissions>
-    ).then(
-      (answer) =>
-        Array.isArray(answer?.operateDenied) ? new Set(answer.operateDenied) : undefined,
-      () => undefined,
-    ));
+  // needs it, and again after a permission reread or an inline Secret create. A failed read keeps
+  // the last answer; before any answer it marks none.
+  const secretsOperateAnswer = secretOperateAnswer(() => request(`${path}/permissions/secrets`));
+  const secretsOperateDenied = secretsOperateAnswer.read;
   context.setTitle(agent.name);
   // A missing summary leaves each control on its usual path, except failed-version
   // recovery, which waits for a positive answer before offering a draft link.
@@ -3263,12 +3267,13 @@ export async function renderAgentDetail(
   // each one the caller may not operate (finding 2453). It is named only when the permission
   // answer, read again too, allows the save's own grants: update on the Configuration for a
   // Configuration save; update, Configuration read and the bound sources for an Agent save.
-  // Otherwise, or when either read fails, the save's usual refusal names every grant it needs.
+  // Otherwise the save's usual refusal names every grant it needs: so it does when the permission
+  // read fails, or when the Secret read fails before any answer (a failed reread keeps the last).
   async function refusedSecretBinding(
     save: "configuration" | "agent",
     secrets: readonly Pick<SecretMetadata, "id" | "name">[],
   ) {
-    secretsOperateRead = null;
+    secretsOperateAnswer.reset();
     const [permissions, denied] = await Promise.all([
       readPermissions().catch(() => null),
       secretsOperateDenied(),
@@ -3285,7 +3290,7 @@ export async function renderAgentDetail(
 
   // Reads the caller's permission answer again; a failed read keeps the last answer.
   function rereadPermissions() {
-    secretsOperateRead = null;
+    secretsOperateAnswer.reset();
     const previous = latestPermissionsRead;
     const reread = ++permissionsRereads;
     const read = readPermissions().then(
@@ -3554,11 +3559,23 @@ export async function renderAgentDetail(
           ? rereadPermissions().then((fresh) => fresh?.sandboxPolicyRead)
           : permissions?.sandboxPolicyRead,
       );
+      // The version's snapshot says whether it runs in a Sandbox, whose log alone records
+      // policy denials; without one the tab reads no log (finding 2484). The draft reads none.
+      let sandboxLogSource: Promise<boolean | undefined> | undefined;
+      if (selected !== "draft") {
+        details ??= loadDetails();
+        sandboxLogSource = details.then((result) =>
+          result && "draft" in result && !result.draft
+            ? result.snapshot.sandboxDriverId !== undefined
+            : undefined,
+        );
+      }
       content.append(
         renderAgentDriverConfigurations(tabContext, {
           agent,
           revisionId: selected,
           policyReadAllowed,
+          ...(sandboxLogSource ? { sandboxLogSource } : {}),
         }),
       );
       state.loading = false;
@@ -5007,6 +5024,7 @@ export async function renderAgentDetail(
       }
       let mutationStarted = false;
       let configurationSaved = false;
+      let refusedInEditor = false;
       try {
         const [freshAgent, freshConfig] = await Promise.all([
           readAgent(),
@@ -5057,14 +5075,24 @@ export async function renderAgentDetail(
           reloadRequired = true;
           return;
         }
-        setStatusTone(feedback, "danger");
-        feedback.textContent =
-          configurationConflictMessage(error, mutationStarted && !configurationSaved) ??
-          rejectionMessage(error, mutationStarted);
-        // The edited JSON holds the refused channel reference (finding 2319).
+        // The edited JSON holds the refused channel reference (finding 2319). Like invalid JSON,
+        // it gets one message, under the editor, which takes focus (finding 2494). This editor
+        // saves no Secret bindings, so a refusal that asks for one says where the console makes it.
         const channelRefusal = channelBindingRefusal(error);
         if (channelRefusal !== undefined) {
-          editorError.show(channelRefusal);
+          editorError.show(
+            channelRefusal.includes(" in secretBindings")
+              ? `${channelRefusal} ${CHANNEL_BINDING_CONSOLE_REMEDY}`
+              : channelRefusal,
+          );
+          setStatusTone(feedback, null);
+          feedback.textContent = "";
+          refusedInEditor = true;
+        } else {
+          setStatusTone(feedback, "danger");
+          feedback.textContent =
+            configurationConflictMessage(error, mutationStarted && !configurationSaved) ??
+            rejectionMessage(error, mutationStarted);
         }
         feedbackLocked = true;
         outcomeUnknown =
@@ -5076,7 +5104,10 @@ export async function renderAgentDetail(
           render();
           const refused = feedback.dataset.tone === "danger";
           feedback.setAttribute("role", refused ? "alert" : "status");
-          if (container.isConnected && refused && !outcomeUnknown && !reloadRequired) {
+          if (refusedInEditor && container.isConnected) {
+            editor.focus({ preventScroll: true });
+            editor.scrollIntoView({ block: "nearest" });
+          } else if (container.isConnected && refused && !outcomeUnknown && !reloadRequired) {
             // A refusal Reload cannot fix (a 403, say) is an alert that takes focus and comes
             // into view; under the fold, nothing seemed to happen (finding 1991).
             revealStatus(feedback, container);

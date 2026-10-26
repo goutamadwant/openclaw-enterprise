@@ -15,7 +15,7 @@ import {
   statusBlock,
   validateFields,
 } from "../dom.mjs";
-import { message, namespacePath } from "./list.mjs";
+import { message, namespaceListNeed, namespacePath } from "./list.mjs";
 import { NAME_MAX_CHARACTERS, namespaceNameProblem } from "../namespaces.mjs";
 import { secretValueControl } from "../secrets.mjs";
 
@@ -35,6 +35,15 @@ export const SECRET_CREATE_DENIED =
 // refused (finding 2453).
 export const SECRET_OPERATE_DENIED =
   "Binding it needs Secret operate, which your access does not include.";
+// A new Secret gets no Secret operate grant of its own. A caller denied operate on a readable
+// Secret holds it per Secret, not across the Namespace, so Agent create would refuse a new one
+// after it was saved (finding 2492).
+export const NEW_SECRET_OPERATE_DENIED =
+  "Your access includes Secret operate on only some Secrets in this Namespace, so an Agent cannot use a new Secret you create here.";
+// What works instead. Namespace Roles grant Secret operate on one exact Secret, never across the
+// Namespace, so the remedy names that grant (finding 2507).
+export const NEW_SECRET_OPERATE_REMEDY =
+  "To use a new Secret, create it on the Secrets page, then ask an administrator to grant you Secret operate on that Secret.";
 
 // The API's Name length for Secrets, in code points: the Name rule namespaces.mts mirrors.
 export const SECRET_NAME_MAX_CHARACTERS = NAME_MAX_CHARACTERS;
@@ -307,8 +316,8 @@ export function createSecretReferenceField({
   // 2453). An unknown answer marks none, and a Secret it does not list stays choosable.
   let operateDenied: ReadonlySet<string> = new Set();
   let operateRead: Promise<void> | null = null;
-  function readOperateAnswer() {
-    const read = (context.secretsOperateDenied?.() ?? Promise.resolve(undefined)).then(
+  function readOperateAnswer(options?: { fresh?: boolean }) {
+    const read = (context.secretsOperateDenied?.(options) ?? Promise.resolve(undefined)).then(
       (denied) => {
         if (!isCurrent() || read !== operateRead) {
           return;
@@ -317,6 +326,9 @@ export function createSecretReferenceField({
         if (listboxOpen) {
           renderListbox();
         }
+        if (listedHint && !staged) {
+          status.textContent = listedStatus();
+        }
       },
       () => {},
     );
@@ -324,6 +336,12 @@ export function createSecretReferenceField({
     return read;
   }
   const secretOperateDenied = (secret: SecretMetadata) => operateDenied.has(secret.id);
+  // Why the inline create action is disabled, if it is. A caller denied operate on a listed
+  // Secret holds Secret operate per Secret, so a new Secret would get none and could not be
+  // chosen: the action is disabled before the Secret is created, as the Preset's Create new Secret
+  // choice is (finding 2500). An empty answer cannot tell, so the create is checked afterwards.
+  const newSecretDenied = () =>
+    createDenied ? SECRET_CREATE_DENIED : operateDenied.size ? NEW_SECRET_OPERATE_DENIED : null;
   function readCreateAnswer() {
     void context.secretsCreateAllowed?.().then((allowed) => {
       if (!isCurrent() || createDenied === (allowed === false)) {
@@ -462,8 +480,8 @@ export function createSecretReferenceField({
           (option.kind === "secret" && option.secret.id === selectedSecretId) ||
           (option.kind === "current" && selectedSecretId !== null);
         const reason =
-          option.kind === "create" && createDenied
-            ? SECRET_CREATE_DENIED
+          option.kind === "create"
+            ? newSecretDenied()
             : option.kind === "secret" && secretOperateDenied(option.secret)
               ? SECRET_OPERATE_DENIED
               : null;
@@ -558,6 +576,9 @@ export function createSecretReferenceField({
         ? `Choose an existing Secret. ${SECRET_CREATE_DENIED}`
         : `No Secrets you can read in this Namespace. ${SECRET_CREATE_DENIED} Ask an administrator for read access to an existing one.`;
     }
+    if (operateDenied.size) {
+      return `Choose an existing Secret. ${NEW_SECRET_OPERATE_DENIED} ${NEW_SECRET_OPERATE_REMEDY}`;
+    }
     return secrets.length
       ? "Choose an existing Secret or create a new one."
       : context.installationAdmin === false
@@ -621,7 +642,7 @@ export function createSecretReferenceField({
 
   function selectOption(option: SecretOption) {
     if (option.kind === "create") {
-      if (createDenied) {
+      if (newSecretDenied()) {
         return;
       }
       closeListbox({ restoreSelection: true });
@@ -769,6 +790,14 @@ export function createSecretReferenceField({
         if (!createdSecret) {
           throw new Error("The create response did not identify the requested Secret.");
         }
+        // The operate answer read when the list opened predates this Secret, so it never names
+        // it: read the answer again, dropping the page's cached copy, before binding it. A Secret
+        // the caller may create but not operate is then refused here, not by the save's 403
+        // (finding 2486).
+        await readOperateAnswer({ fresh: true });
+        if (!dialog.open || !isCurrent()) {
+          return;
+        }
         await bindSecret(createdSecret);
         if (!dialog.open || !isCurrent()) {
           return;
@@ -889,7 +918,7 @@ export function createSecretReferenceField({
         setStatusTone(status, "danger");
         status.textContent = expired
           ? "Your session has expired."
-          : `Secrets unavailable. ${message(error)}`;
+          : `Secrets unavailable. ${message(error, false, namespaceListNeed("Secrets"))}`;
         if (expired) {
           context.onExpired?.();
         }

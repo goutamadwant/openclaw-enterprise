@@ -10,6 +10,7 @@ import { createConsoleAppFixture } from "../helpers/console-app.mjs";
 import { createTestKubernetesComputeDriver } from "../helpers/kubernetes-compute.mjs";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
 import { createTestConfigurationDriver } from "../helpers/configuration-driver.mjs";
+import { SlackChannelDriver } from "../../apps/controller/src/drivers/channel/slack.ts";
 import {
   apiRequests,
   fileBrowser,
@@ -17,7 +18,12 @@ import {
   login,
   nativeValues,
   newPage,
+  operateDeniedSecretOption,
   pathRequests,
+  revokeAdministratorGrant,
+  selectSecret,
+  setSlackSelection,
+  trackSettledFetches,
   waitForEnabled,
 } from "./console-agents-browser-helpers.mjs";
 import {
@@ -31,17 +37,20 @@ import {
   openAdvancedSettings,
   routeInstallationProvisioning,
   routeInstallationWithoutProvisioning,
+  runProvisioningPolls,
   waitForProvisioningFailure,
 } from "./console-agents-test-support.mjs";
 import { createRuntimeAuthFixture } from "./console-agents-runtime-auth-fixture.mjs";
 import { createReadyConsoleNamespace } from "./console-ready-namespace.mjs";
 import {
   AGENT_NAME_CONFLICT,
+  CHANNEL_BINDING_FORM_REMEDY,
   CODEX_PLACEMENT_REFUSAL,
   DEDICATED_PLACEMENT_REQUIREMENT,
   DEPENDENCY_UNAVAILABLE,
   GENERIC_DENIAL,
   NAMESPACE_NOT_READY,
+  referenceFormRefusal,
   RESOURCE_CONFLICT,
 } from "../helpers/refusal-text.mjs";
 
@@ -280,6 +289,46 @@ test("Dedicated Agent provisioning refuses a taken Agent name at admission and m
   assert.equal(await page.getByLabel("Agent name").getAttribute("aria-invalid"), null);
 });
 
+// Admission checks Secret operate on the Harness authentication Secret, so a refused provisioning
+// request can follow a revoked grant. As after a refused Agent create, the Secret field reads the
+// operate answer again when it next opens, instead of offering the key from its cached answer.
+test("A refused provisioning request reads the Secret answer again", async (t) => {
+  const fixture = await createConsoleAppFixture(t, {
+    ...provisioningDrivers(),
+    defaultPresets: [defaultCodexPreset],
+  });
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Provision revoked operate", { ready: true });
+  const secret = await fixture.createSecret(namespace.id, "Provision model key", "sk-provision");
+  const { page } = await newPage(t, fixture, { browser });
+  const requests = apiRequests(page, fixture.origin);
+  const answerPath = `/namespaces/${namespace.id}/permissions/secrets`;
+  await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`);
+  await page.getByRole("button", { name: "Start with default Preset", exact: true }).click();
+  await page.getByLabel("Agent name", { exact: true }).fill("Revoked operate Agent");
+  await selectSecret(page, "API key Secret", secret);
+  await page.getByText("Secret selected. Create Agent binds it.").waitFor();
+  const model = page.getByLabel("Model ID", { exact: true });
+  if (!(await model.isVisible())) {
+    await page.getByRole("button", { name: "Enter model ID manually", exact: true }).click();
+  }
+  await model.fill("gpt-5.1");
+  await model.press("Tab");
+  // Secret operate is revoked after the key is staged: the real admission refuses the request.
+  revokeAdministratorGrant(fixture, ["operate", "secret"]);
+  const refused = page.waitForResponse(
+    (response) =>
+      response.url() === `${fixture.origin}/namespaces/${namespace.id}/agents/provision` &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Create Agent", exact: true }).click();
+  assert.equal((await refused).status(), 403);
+  // The field reads the answer again and now lists the key disabled with the reason.
+  await operateDeniedSecretOption(page, "API key Secret", secret);
+  assert.equal(pathRequests(requests, "GET", answerPath).length, 2);
+  assert.equal(agentProvisionPostRequests(requests, namespace.id).length, 1);
+});
+
 // A request lost in transit leaves its outcome unknown, so the form locks the plan: the API may
 // have admitted it. A resend of an admitted request returns its job before the name check, so a
 // name 409 to the resend proves nothing was admitted, and the name field unlocks for a new name
@@ -376,6 +425,117 @@ test("The pinned runtime lets the Console request dedicated OpenClaw provisionin
   // No draft writes or external provisioning effects occur in this fixture.
   assert.equal(agentProvisionPostRequests(requests, namespace.id).length, 1);
   assert.equal(pathRequests(requests, "POST", `/namespaces/${namespace.id}/agents`).length, 0);
+});
+
+test("Create Agent names a refused Slack token form once, under its Configuration JSON", async (t) => {
+  // Finding 2506: with both Slack Secrets selected, every refused botToken form typed into Create
+  // Agent's own Configuration JSON got the Slack Channel Driver's generic "Select an
+  // environment-backed Secret" alert, since provisioning asked that Driver before the
+  // Configuration rules. Now the rule's own message shows once, as the JSON's field error.
+  const fixture = await createConsoleAppFixture(t, {
+    ...provisioningDrivers(),
+    sandboxDriver: nativeSandboxDriver(),
+  });
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Provision Slack forms", { ready: true });
+  const slackApp = await fixture.createSecret(namespace.id, "Forms Slack app", "xapp-forms");
+  const slackBot = await fixture.createSecret(namespace.id, "Forms Slack bot", "xoxb-forms");
+  let slackCalls = 0;
+  const channel = new SlackChannelDriver(async () => {
+    slackCalls++;
+    return new Response(JSON.stringify({ ok: true, bot_id: "B123", team_id: "T123" }));
+  });
+  fixture.controller.registerDriver(channel);
+  fixture.controller.selectDriver("channel", channel.id);
+  const { page } = await newPage(t, fixture, { browser });
+  const requests = apiRequests(page, fixture.origin);
+  await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`);
+  await page.getByRole("button", { name: "Start without Preset" }).click();
+  await page.getByLabel("Harness", { exact: true }).selectOption("openclaw");
+  await page.locator(".launch-runtime:not([open]) > summary").click();
+  await page.getByLabel("Execution mode").selectOption("dedicated");
+  await page.getByLabel("Agent name").fill("Slack token forms");
+  await createModelCredentialSecret(page, "synthetic-forms-model-key");
+  await page.getByRole("button", { name: "Enter model ID manually", exact: true }).click();
+  await page.getByLabel("Model ID", { exact: true }).fill("gpt-5");
+  await page.getByLabel("Model ID", { exact: true }).press("Tab");
+  await page.getByRole("button", { name: "Configure Slack" }).click();
+  const slack = page.getByRole("dialog", { name: "Configure Slack" });
+  await slack.getByLabel("Direct-message policy").selectOption("disabled");
+  await setSlackSelection(
+    slack.getByRole("combobox", { name: "Channels", exact: true }),
+    "CFORMS1",
+  );
+  await slack.getByLabel("Who can use the agent in these channels?").selectOption("everyone");
+  await selectSecret(slack, "Slack app token", slackApp);
+  await selectSecret(slack, "Slack bot token", slackBot);
+  await slack.getByRole("button", { name: "Apply channel settings" }).click();
+  await openAdvancedSettings(page);
+  const configuration = page.getByLabel("Configuration JSON");
+  const values = JSON.parse(await configuration.inputValue());
+  const jsonError = page.locator("#configuration-json-error");
+  // The Slack card names a token pasted as the value the way Configuration save does, and does
+  // not show it (finding 2523).
+  values.channels.slack.botToken = "xoxb-pasted-card-token";
+  await configuration.fill(JSON.stringify(values, null, 2));
+  const inline = "holds a credential value inline, where a reference is required";
+  const reference = "uses a credential reference this editor does not write";
+  const cardText = (form) =>
+    `Slack bot token ${form}. To edit Slack here, set botToken to \${SLACK_BOT_TOKEN} in the Configuration JSON.`;
+  const card = page.locator(".channel-card", { hasText: "Slack bot token holds" });
+  await card.getByText(cardText(inline), { exact: true }).waitFor();
+  // Its closed native configuration disclosure is the JSON the reader typed, not card text.
+  assert.doesNotMatch(await card.innerText(), /xoxb-pasted/);
+  // The Slack editor's channel field looked names up; Create Agent must not call Slack again.
+  const lookups = slackCalls;
+  const submitWith = async (botToken) => {
+    values.channels.slack.botToken = botToken;
+    await configuration.fill(JSON.stringify(values, null, 2));
+    const sent = page.waitForResponse(
+      (response) =>
+        response.url() === `${fixture.origin}/namespaces/${namespace.id}/agents/provision` &&
+        response.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: "Create Agent" }).click();
+    const response = await sent;
+    assert.equal(response.status(), 400, botToken);
+    return (await response.json()).error;
+  };
+  for (const [botToken, message, form] of [
+    [
+      "xoxb-${SLACK_BOT_TOKEN}",
+      referenceFormRefusal("channels.slack.botToken", "otherText"),
+      reference,
+    ],
+    // A `$` before a name the runtime does not read is the token itself (finding 2517), and the
+    // card says so too (finding 2530).
+    ["$xoxbSECRET", referenceFormRefusal("channels.slack.botToken", "inline"), inline],
+    [
+      "${SLACK_SPARE_TOKEN}",
+      "Configuration setting channels.slack.botToken references SLACK_SPARE_TOKEN without a Configuration Secret binding: bind SLACK_SPARE_TOKEN in secretBindings to an environment-backed Secret, or remove the reference.",
+      reference,
+    ],
+  ]) {
+    const error = await submitWith(botToken);
+    assert.equal(error.message, message, botToken);
+    await page.locator(".channel-card").getByText(cardText(form), { exact: true }).waitFor();
+    // A refusal that asks for a binding says where this form makes one.
+    const shown = message.includes(" in secretBindings")
+      ? `${message} ${CHANNEL_BINDING_FORM_REMEDY}`
+      : message;
+    await jsonError.getByText(shown, { exact: true }).waitFor();
+    // Once: no alert repeats it, and the JSON that holds the value takes focus.
+    assert.equal(await page.getByText(message).count(), 1, botToken);
+    assert.equal(await page.getByRole("alert").filter({ hasText: /\S/ }).count(), 0, botToken);
+    assert.equal(await configuration.getAttribute("aria-invalid"), "true");
+    await page.waitForFunction(
+      () => globalThis.document.activeElement?.id === "configuration-json",
+    );
+  }
+  // Refused before Slack was asked, and nothing was saved.
+  assert.equal(slackCalls, lookups);
+  assert.equal(agentProvisionPostRequests(requests, namespace.id).length, 3);
+  assert.equal(configurationPostRequests(requests, namespace.id).length, 0);
 });
 
 test("Credential Gateway creation registers the same model source for both dedicated harnesses", async (t) => {
@@ -2090,6 +2250,7 @@ test("Create Agent drops the Pod quota line when the deployment read is denied",
     },
   );
 
+  await trackSettledFetches(page);
   await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`);
   await page.getByRole("heading", { name: "Create Agent" }).waitFor();
   await page.getByRole("button", { name: "Start without Preset" }).click();
@@ -2108,9 +2269,14 @@ test("Create Agent drops the Pod quota line when the deployment read is denied",
       }
     }).observe(globalThis.document.body, { childList: true, subtree: true });
   });
-  await page.getByRole("button", { name: "Create Agent" }).click();
   // Wide enough that the page is wider than the form (finding 2423).
   await page.setViewportSize({ width: 1440, height: 900 });
+  await runProvisioningPolls(
+    page,
+    () => page.getByRole("button", { name: "Create Agent" }).click(),
+    url,
+    reads.length,
+  );
   await waitForProvisioningFailure(page);
   assert.equal(read, reads.length);
   assert.equal(deploymentReads, 3);

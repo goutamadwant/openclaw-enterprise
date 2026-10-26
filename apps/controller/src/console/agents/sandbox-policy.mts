@@ -29,6 +29,12 @@ const NO_CURRENT_VERSION_DENIALS =
   "Policy denials come from deployed versions. This Agent has no current version.";
 const NO_CURRENT_VERSION_SUGGESTIONS =
   "Suggestions come from deployed versions. This Agent has no current version.";
+// A version that runs without a Sandbox has no Sandbox log, so there are no denials to read: the
+// read would answer 400 "no such runtime log source" (finding 2484).
+const NO_SANDBOX_DENIALS =
+  "This Agent version runs without a Sandbox, so no policy denials are recorded for it.";
+const NO_SANDBOX_SUGGESTIONS =
+  "Suggestions come from policy denials. This Agent version runs without a Sandbox, so it has none.";
 type LogLine = Extract<RuntimeLogRecord, { type: "line" }>;
 
 function errorText(cause: unknown, subject: string) {
@@ -134,12 +140,16 @@ export function renderAgentSandboxPolicy(
     revisionId,
     descriptor,
     policyReadAllowed,
+    sandboxLogSource,
   }: {
     agent: Pick<Agent, "id" | "namespaceId" | "activeRevisionId" | "desiredRuntimeState">;
     revisionId: string;
     descriptor?: DriverConfigurationDescriptor;
     // The caller's advisory sandbox policy read answer; undefined when it is unknown.
     policyReadAllowed?: Promise<boolean | undefined>;
+    // Whether the viewed version has a Sandbox log source, from its snapshot; undefined when it
+    // is unknown, which reads the log and lets its answer decide.
+    sandboxLogSource?: Promise<boolean | undefined>;
   },
 ) {
   const path = `${namespacePath(agent.namespaceId)}/agents/${encodeURIComponent(agent.id)}`;
@@ -159,6 +169,12 @@ export function renderAgentSandboxPolicy(
     "Denials in the loaded window: —",
   );
   const follow = element("input", { type: "checkbox", "aria-label": "Follow policy denials" });
+  const logActions = element(
+    "div",
+    { className: "form-actions" },
+    button("Refresh denials", () => void readLogs(true)),
+    element("label", {}, follow, "Follow"),
+  );
   const feedback = element("p", { role: "status", tabindex: "-1" });
   const suggestionStatus = element("p", { role: "status" }, "Loading policy suggestions…");
   const filter = element("input", {
@@ -166,6 +182,12 @@ export function renderAgentSandboxPolicy(
     placeholder: "Filter loaded denials",
     "aria-label": "Filter loaded denials",
   });
+  const filterField = element(
+    "label",
+    { className: "form-field" },
+    "Filter the loaded window",
+    filter,
+  );
   let view: SandboxPolicyViewWire | undefined;
   let validationDetails: Readonly<ReturnType<typeof requestErrorDetails>> = [];
   let draftGeneration = 0;
@@ -184,6 +206,32 @@ export function renderAgentSandboxPolicy(
   let suggestionsReading = false;
   // A permission refusal is not retried from here: the same request gets the same answer.
   let suggestionsDenied = false;
+  // Set once the viewed version is known to have no Sandbox log source.
+  let noSandboxLog = false;
+  async function sandboxLogMissing() {
+    if (
+      !noSandboxLog &&
+      (await Promise.resolve(sandboxLogSource).catch(() => undefined)) === false
+    ) {
+      noSandboxLog = true;
+    }
+    return noSandboxLog;
+  }
+  // Without a Sandbox log, the denial window and its controls can show nothing, so only the reason
+  // stays (finding 2497).
+  function showNoSandboxDenials() {
+    follow.checked = false;
+    clearTimeout(logTimer);
+    clearTimeout(suggestionTimer);
+    records = [];
+    logsLoaded = false;
+    logStatus.textContent = NO_SANDBOX_DENIALS;
+    logRows.replaceChildren();
+    // The empty rows block keeps its margins and a grid gap: hide it too (finding 2522).
+    for (const node of [count, logActions, filterField, logRows]) {
+      node.hidden = true;
+    }
+  }
   // Set when the caller's permission answer denies sandbox policy read: the policy and its
   // suggestions are not read, so a reader meets no 403 and no refusal block (finding 2454).
   let policyReadDenied = false;
@@ -288,6 +336,12 @@ export function renderAgentSandboxPolicy(
     if (!(await policySupported()) || reading) {
       return;
     }
+    if (await sandboxLogMissing()) {
+      if (current()) {
+        showNoSandboxDenials();
+      }
+      return;
+    }
     clearTimeout(logTimer);
     reading = true;
     if (restart) {
@@ -315,6 +369,12 @@ export function renderAgentSandboxPolicy(
       renderLogs();
     } catch (error) {
       if (!current()) {
+        return;
+      }
+      if (requestFailure(error).code === "RUNTIME_LOGS_SOURCE_UNAVAILABLE") {
+        // The snapshot could not say; the answer does, and it is the same for every read.
+        noSandboxLog = true;
+        showNoSandboxDenials();
         return;
       }
       follow.checked = false;
@@ -373,7 +433,11 @@ export function renderAgentSandboxPolicy(
           editable() ? button("Review suggestion", () => prefill(entry.grant)) : null,
         ),
       ),
-      ...(suggestionsDenied ? [] : [button("Refresh suggestions", () => void loadSuggestions())]),
+      // A refusal gets the same answer again, and a version without a Sandbox has none to read,
+      // nor does the draft (finding 2509).
+      ...(suggestionsDenied || noSandboxLog || revisionId === "draft"
+        ? []
+        : [button("Refresh suggestions", () => void loadSuggestions())]),
     );
   }
 
@@ -388,9 +452,10 @@ export function renderAgentSandboxPolicy(
       return;
     }
     if (policyReadDenied) {
+      // The network policy card says this reader cannot read the policy or its suggestions, so
+      // the suggestions card would only repeat that sentence (finding 2522).
       suggestionsDenied = true;
-      suggestionStatus.textContent = POLICY_READ_DENIED;
-      renderSuggestions();
+      suggestions.hidden = true;
       return;
     }
     if (revisionId === "draft") {
@@ -401,6 +466,13 @@ export function renderAgentSandboxPolicy(
       return;
     }
     if (!(await policySupported()) || suggestionsReading) {
+      return;
+    }
+    if (await sandboxLogMissing()) {
+      if (current()) {
+        suggestionStatus.textContent = NO_SANDBOX_SUGGESTIONS;
+        renderSuggestions();
+      }
       return;
     }
     clearTimeout(suggestionTimer);
@@ -991,14 +1063,9 @@ export function renderAgentSandboxPolicy(
   section.append(
     element("h2", {}, "Policy denials"),
     count,
-    element(
-      "div",
-      { className: "form-actions" },
-      button("Refresh denials", () => void readLogs(true)),
-      element("label", {}, follow, "Follow"),
-    ),
+    logActions,
     logStatus,
-    element("label", { className: "form-field" }, "Filter the loaded window", filter),
+    filterField,
     logRows,
     suggestions,
     policyPanel,
@@ -1020,6 +1087,11 @@ export function renderAgentSandboxPolicy(
     logStatus.textContent = agent.activeRevisionId
       ? "Policy denials come from deployed versions. Open the current version to see them."
       : NO_CURRENT_VERSION_DENIALS;
+    // It reads no Sandbox log, so the window's count, controls and rows could only show nothing,
+    // as on a version without a Sandbox (findings 2509, 2522).
+    for (const node of [count, logActions, filterField, logRows]) {
+      node.hidden = true;
+    }
   } else {
     void readLogs(true);
   }

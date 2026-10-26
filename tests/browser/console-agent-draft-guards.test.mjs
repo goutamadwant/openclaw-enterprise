@@ -167,6 +167,36 @@ test("Policy denials says once that the Sandbox Driver lacks per-Agent network p
   assert.equal(await page.getByText("does not support per-Agent network policy").count(), 1);
 });
 
+// A version a Sandbox Driver provisioned names it in its snapshot, so the Policy denials tab reads
+// its Sandbox log. Only a version without one skips the read (finding 2484).
+test("Policy denials reads the Sandbox log of a version a Sandbox Driver provisioned", async (t) => {
+  const { fixture, namespace, agent } = await createPolicyConsole(t);
+  const { revision } = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
+  const agentPath = `/namespaces/${namespace.id}/agents/${agent.id}`;
+  const snapshot = await fixture.request("GET", `${agentPath}/revisions/${revision.id}`);
+  assert.equal(snapshot.data.sandboxDriverId, "policy-openshell");
+  const { page } = await newPage(t, fixture);
+  const requests = apiRequests(page, fixture.origin);
+  await login(page, fixture, detailUrl(fixture, namespace.id, agent.id, revision.id, "policy"));
+  await waitForCondition(
+    () =>
+      requests.some(({ path }) =>
+        path.startsWith(`${agentPath}/deployments/${revision.id}/runtime/logs?source=sandbox`),
+      ),
+    "the Sandbox log is read",
+  );
+  assert.equal(await page.getByText(/runs without a Sandbox/).count(), 0);
+  // Its denial window keeps its controls (finding 2497 hides them only without a Sandbox).
+  const tab = page.locator(".sandbox-policy");
+  for (const control of [
+    tab.getByRole("button", { name: "Refresh denials" }),
+    tab.getByRole("checkbox", { name: "Follow policy denials" }),
+    tab.getByRole("searchbox", { name: "Filter loaded denials" }),
+  ]) {
+    assert.equal(await control.isVisible(), true);
+  }
+});
+
 // A member whose grants do not include the Agent's SandboxPolicy gets a refusal; Retry would only
 // ask again for the same answer (finding 2060). With a permission answer the console skips the
 // read instead (finding 2454), so the answer is withheld here to reach the API's refusal.
@@ -268,12 +298,39 @@ test("A policy read grant after the page loaded shows the policy on the first vi
 
 // The draft has no deployment of its own. With a current version, its denials and suggestions
 // are on that version; without one (never deployed, stopped, or first deployment running) the
-// tab says so instead of telling every reader to deploy.
+// tab says so instead of telling every reader to deploy. It reads no Sandbox log, so the denial
+// window's count and controls, which could only show nothing, are hidden (finding 2509).
 test("Policy denials on the draft says where denials and suggestions come from", async (t) => {
   const { fixture, namespace, agent } = await createPolicyConsole(t);
   const { page } = await newPage(t, fixture);
   await login(page, fixture, detailUrl(fixture, namespace.id, agent.id, "draft", "policy"));
   const tab = page.locator(".sandbox-policy");
+  const assertNoWindowControls = async () => {
+    assert.equal(await tab.getByText(/Denials in the loaded window/).isVisible(), false);
+    for (const name of ["Refresh denials", "Refresh suggestions"]) {
+      assert.equal(await tab.getByRole("button", { name }).count(), 0, name);
+    }
+    assert.equal(await tab.getByRole("checkbox", { name: "Follow policy denials" }).count(), 0);
+    assert.equal(await tab.getByRole("searchbox", { name: "Filter loaded denials" }).count(), 0);
+    // No empty band where the rows would be: only the grid gap and the two elements' own margins
+    // separate the reason from the suggestions card (finding 2522).
+    assert.equal(await tab.locator(".sandbox-decisions").isVisible(), false);
+    const band = await tab.evaluate((section) => {
+      const style = (node) => globalThis.getComputedStyle(node);
+      const reason = [...section.children].find((node) =>
+        node.textContent?.startsWith("Policy denials come from deployed versions."),
+      );
+      const card = section.querySelector(":scope > .agent-card");
+      return {
+        expected:
+          Number.parseFloat(style(section).rowGap) +
+          Number.parseFloat(style(reason).marginBottom) +
+          Number.parseFloat(style(card).marginTop),
+        space: card.getBoundingClientRect().top - reason.getBoundingClientRect().bottom,
+      };
+    });
+    assert.ok(Math.abs(band.space - band.expected) < 1, JSON.stringify(band));
+  };
   await tab
     .getByText("Policy denials come from deployed versions. This Agent has no current version.")
     .waitFor();
@@ -281,6 +338,7 @@ test("Policy denials on the draft says where denials and suggestions come from",
     .getByText("Suggestions come from deployed versions. This Agent has no current version.")
     .waitFor();
   assert.equal(await tab.getByText(/^Deploy an Agent/).count(), 0);
+  await assertNoWindowControls();
 
   await fixture.seedActiveAgentRevision(namespace.id, agent.id);
   await page.reload();
@@ -290,6 +348,7 @@ test("Policy denials on the draft says where denials and suggestions come from",
   await tab
     .getByText("Suggestions come from deployed versions. Open the current version to see them.")
     .waitFor();
+  await assertNoWindowControls();
 });
 
 const delegatedPolicyGrant = {

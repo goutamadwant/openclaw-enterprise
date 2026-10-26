@@ -63,6 +63,7 @@ import {
   GENERIC_DENIAL,
   RESOURCE_NOT_FOUND,
   WORKSPACE_FILES_UNAVAILABLE,
+  accessDeniedNeeding,
 } from "../helpers/refusal-text.mjs";
 
 // The Console Browser lane runs the two Agent detail test files in parallel.
@@ -2344,6 +2345,12 @@ test("a read-only viewer is denied saved settings and native admin once per tab,
   await login(page, fixture, detail, viewer.credentials);
   const unavailable = page.getByRole("heading", { name: "Configuration unavailable" });
   await unavailable.waitFor();
+  // The viewer holds Agent read but not Configuration read: the panel names that grant.
+  const draftDenied = page.getByText(
+    accessDeniedNeeding("Reading this Agent's draft Configuration", "Configuration read"),
+    { exact: true },
+  );
+  await draftDenied.waitFor();
   const configurationPath = `/namespaces/${namespace.id}/configurations/${agent.configurationId}`;
   const nativeAdminPath = `/namespaces/${namespace.id}/agents/${agent.id}/native-admin`;
   const reads = (path) => requests.filter((request) => request.path === path).length;
@@ -2362,6 +2369,8 @@ test("a read-only viewer is denied saved settings and native admin once per tab,
   for (let view = 0; view < 2; view += 1) {
     await page.reload();
     await unavailable.waitFor();
+    // The remembered denial names the same grant without asking again.
+    await draftDenied.waitFor();
   }
   // The native admin card asks for status as it renders, before the denial panel shows.
   await settlePageRequests(page);
@@ -2493,28 +2502,59 @@ test("an Agent reader meets no refused read on Repositories, Policy denials or L
   await page
     .getByText("Policy denials come from deployed versions. Open the current version to see them.")
     .waitFor();
-  await page
-    .getByText(
-      "Your access does not include reading this Agent’s network policy or its suggestions.",
-    )
-    .first()
-    .waitFor();
+  const noPolicyAccess = page.getByText(
+    "Your access does not include reading this Agent’s network policy or its suggestions.",
+  );
+  await noPolicyAccess.first().waitFor();
   await settle();
   await expectNoText(
     page,
     /Deploy an Agent to load Sandbox policy decisions|permission to read|Suggestions come from/,
   );
+  // The sentence names the suggestions too, so it is said once, on the network policy card: no
+  // suggestions card repeats it (finding 2522).
+  const sayOnce = async () => {
+    assert.equal(await noPolicyAccess.count(), 1);
+    assert.equal(
+      await page.getByRole("heading", { name: "Policy suggestions", exact: true }).isVisible(),
+      false,
+    );
+  };
+  await sayOnce();
 
-  // Policy denials on the current version: still no policy or suggestions read.
+  // Policy denials on the current version: still no policy or suggestions read. The version
+  // runs without a Sandbox, so it has no denial log either: the tab says so instead of reading
+  // it and showing the 400 "no such runtime log source" (finding 2484).
   await page.goto(detailUrl(fixture, namespace.id, agent.id, active.revision.id, "policy").href);
+  await noPolicyAccess.first().waitFor();
   await page
     .getByText(
-      "Your access does not include reading this Agent’s network policy or its suggestions.",
+      "This Agent version runs without a Sandbox, so no policy denials are recorded for it.",
+      { exact: true },
     )
-    .first()
     .waitFor();
   await settle();
-  await expectNoText(page, /permission to read/);
+  await expectNoText(
+    page,
+    /permission to read|no such runtime log source|window: unavailable|Denials in the loaded window/,
+  );
+  await sayOnce();
+  // With no denial log, the window's controls could only show nothing; only the reason stays
+  // (finding 2497).
+  const policyTab = page.locator(".sandbox-policy");
+  for (const name of ["Refresh denials", "Refresh suggestions"]) {
+    assert.equal(await policyTab.getByRole("button", { name }).count(), 0, name);
+  }
+  assert.equal(await policyTab.getByRole("checkbox", { name: "Follow policy denials" }).count(), 0);
+  assert.equal(
+    await policyTab.getByRole("searchbox", { name: "Filter loaded denials" }).count(),
+    0,
+  );
+  assert.deepEqual(
+    requests.filter(({ path }) => path.includes("/runtime/logs")),
+    [],
+    "no Sandbox log read",
+  );
 
   // Logs: the runtime status read needs Agent operate; the strip says so without a refused read.
   await page.getByRole("tab", { name: "Logs", exact: true }).click();

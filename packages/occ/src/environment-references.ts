@@ -1,5 +1,7 @@
 // How the OpenClaw runtime reads environment references in its configuration, at the
 // `OPENCLAW_COMMIT` in `deploy/runtime/Dockerfile`. Update this module when that pin changes.
+// The Console also serves this module (`console-assets.ts`): keep it free of imports and of
+// TypeScript syntax that type stripping cannot erase.
 
 // The runtime resolves `${VAR}` and `${VAR:-fallback}` environment references (uppercase
 // names) before it validates its configuration, so a value that holds one is left to it. Its
@@ -19,6 +21,20 @@ export const environmentReferenceNames = (text: string, { fallbacks = true } = {
       ([, escaped, fallback]) => escaped === undefined && (fallbacks || fallback === undefined),
     )
     .map(([reference]) => reference.slice(2, reference.search(/[:}]/)));
+
+/**
+ * The variable `text` names when it is exactly one `${NAME}` reference the runtime substitutes,
+ * with no fallback and nothing else, not even spaces; otherwise undefined. The runtime replaces
+ * such a value with the variable NAME when it loads its configuration, so a reader of SecretRefs
+ * can read it as the environment SecretRef to NAME.
+ */
+export function wholeEnvironmentReferenceName(text: string): string | undefined {
+  const [first] = text.matchAll(environmentReference);
+  // An escape (`$${NAME}`) names no variable, so `environmentReferenceNames` returns none for it.
+  return first?.[0] === text && first[2] === undefined
+    ? environmentReferenceNames(text)[0]
+    : undefined;
+}
 
 /**
  * The first `${` in `text` that is not a reference the runtime substitutes, up to the `}` that

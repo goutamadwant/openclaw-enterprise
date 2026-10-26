@@ -29,7 +29,7 @@ unavailable.
 | **Require a mention**                                                   | Applies the mention requirement to the listed channels.                                                                                                                                                                                                                                       |
 | **Direct-message policy**                                               | **Pairing** (approve new senders), **Allowlist** (selected users only, the default for a new setup), **Open** (anyone) or **Disabled**. An existing setup without a policy shows **Runtime default (pairing)**.                                                                               |
 | **Allowed people in direct messages**                                   | Users allowed to send direct messages under Allowlist, or preapproved under Pairing. Allowlist needs at least one.                                                                                                                                                                            |
-| **Save configuration**                                                  | Saves channel settings and selected Secret bindings to the shared draft.                                                                                                                                                                                                                      |
+| **Save configuration**                                                  | Saves channel settings and selected Secret bindings to the shared draft. It stays disabled until you change a setting or a Secret binding.                                                                                                                                                    |
 | **Cancel** / **Close**                                                  | Discards the drawer's unsaved inputs.                                                                                                                                                                                                                                                         |
 
 Name search needs a reachable Slack directory; when it is unavailable, the drawer says so and
@@ -42,9 +42,12 @@ needs Secret `operate` on that Secret, as described in [Channel Secrets](#channe
 
 A Configuration save refuses an enabled channel whose token reference has no
 Secret binding. The refusal names the setting and the binding, for example
-`channels.slack.botToken` and `SLACK_BOT_TOKEN`, under the Configuration JSON
-when you edit it there. Select the token Secrets in the Slack editor, or remove
-the reference.
+`channels.slack.botToken` and `SLACK_BOT_TOKEN`, once, under the Configuration JSON
+when you edit it there or on Create Agent. Select the token Secrets in the Slack
+editor or on the Credentials tab, or remove the reference. A token must be
+exactly one `${NAME}`: `$NAME`, a fallback, or other text, spaces or references
+with `${NAME}` are refused, and the message names the form. The Slack editor opens tokens saved as `${SLACK_APP_TOKEN}` and
+`${SLACK_BOT_TOKEN}` and keeps that form.
 See [Slack setup](../integrations/slack.md) for credentials and policy details.
 
 In any Secret picker, typing a Secret's exact name selects it when you press

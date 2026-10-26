@@ -13,16 +13,28 @@ import type {
 import { apiErrorResponse } from "../helpers/api-error.mjs";
 import { createConsoleAppFixture } from "../helpers/console-app.mjs";
 import {
+  deniedCreateSecretOption,
+  grantMember,
+  grantSecretOperate,
   holdRequests,
   login,
   MEMBER_WRITE,
+  memberWriteWithout,
   newPage,
   operateDeniedSecretOption,
+  revokeMemberGrant,
   selectSecret,
+  waitForCondition,
   waitForEnabled,
 } from "./console-agents-browser-helpers.mjs";
 import { waitForCreateFormReads } from "./console-agents-test-support.mjs";
-import { GENERIC_DENIAL, SECRET_OPERATE_DENIED } from "../helpers/refusal-text.mjs";
+import {
+  AGENT_CREATE_DENIED,
+  GENERIC_DENIAL,
+  NEW_SECRET_OPERATE_DENIED,
+  NEW_SECRET_OPERATE_REMEDY,
+  SECRET_OPERATE_DENIED,
+} from "../helpers/refusal-text.mjs";
 
 // Create Agent for a Namespace member (UX plan A2, spec 3.11; findings 1901, 493). The real
 // Native IAM Driver answers every read and write: the member's GET /installation is refused, and
@@ -51,6 +63,22 @@ function apiResponses(page: Page, origin: string) {
     }
   });
   return answers;
+}
+
+const standardCodexPreset = JSON.parse(
+  await readFile(new URL("../../deploy/presets/standard-codex.json", import.meta.url), "utf8"),
+);
+
+// The shipped standard Preset, whose model Secret the member chooses or creates.
+async function createStandardPreset(
+  fixture: Awaited<ReturnType<typeof createConsoleAppFixture>>,
+  namespaceId: string,
+) {
+  const preset = await fixture.request("POST", `/namespaces/${namespaceId}/presets`, {
+    body: standardCodexPreset,
+  });
+  assert.equal(preset.status, 201, JSON.stringify(preset.body));
+  return preset;
 }
 
 async function setup(t: TestContext) {
@@ -164,23 +192,28 @@ test("a member with Agent create completes the default Preset path without Insta
 
 test("a member without Agent create never sees the form, and Create Agent names why", async (t) => {
   const { fixture, namespace } = await setup(t);
-  const actions = MEMBER_WRITE.filter(
-    ([action, kind]) => !(action === "create" && kind === "agent"),
+  const limited = await fixture.createNamespaceMember(
+    "member-no-create",
+    namespace.id,
+    memberWriteWithout(["create", "agent"]),
   );
-  const limited = await fixture.createNamespaceMember("member-no-create", namespace.id, actions);
   const { page } = await newPage(t, fixture);
   const answers = apiResponses(page, fixture.origin);
   await login(page, fixture, `/console/agents?namespace=${namespace.id}`, limited.credentials);
   const open = page.getByRole("button", {
     name: "Create Agent",
     exact: true,
-    description: "Your access does not include creating Agents in this Namespace.",
+    // The list's reason gives the Create Agent page's next step (finding 2508).
+    description: AGENT_CREATE_DENIED,
   });
   await open.waitFor();
   assert.equal(await open.isDisabled(), true);
 
   await page.goto(`${fixture.origin}/console/agents/new?namespace=${namespace.id}`);
   await page.getByRole("heading", { name: "Creating Agents is not available" }).waitFor();
+  // Namespace Roles cannot grant Agent create, so the note sends the member to whoever can
+  // create the Agent rather than promising access (finding 2496).
+  await page.getByRole("status").getByText(AGENT_CREATE_DENIED, { exact: true }).waitFor();
   assert.equal(await page.locator("#create-agent-form").count(), 0);
   assert.equal(await page.locator("#create-agent-access").count(), 0);
   assert.equal(await page.getByRole("button", { name: "Start with default Preset" }).count(), 0);
@@ -367,20 +400,29 @@ test("a member's unconfirmed credential grant offers a retry until the API refus
   );
 });
 
+const ADMINISTRATOR_GRANT_REQUEST = "req_00000000-0000-4000-8000-000000002543";
+const ADMINISTRATOR_GRANT_REFUSED = `${CREDENTIAL_ACCESS_UNCONFIRMED} Access denied. You do not have permission for this operation. Retry credential access, or open the saved Agent and ask an administrator to check access to its saved model and channel Secrets. Request ID: ${ADMINISTRATOR_GRANT_REQUEST}`;
+
 test("an administrator's refused credential grant keeps the retry and the API's answer", async (t) => {
   const { fixture, namespace, secret } = await setup(t);
   const { page } = await newPage(t, fixture);
   await page.route(`${fixture.origin}/namespaces/${namespace.id}/iam/roles`, (route) =>
-    route.fulfill(apiErrorResponse(403, "FORBIDDEN", GENERIC_DENIAL)),
+    route.fulfill(
+      apiErrorResponse(403, "FORBIDDEN", GENERIC_DENIAL, {
+        requestId: ADMINISTRATOR_GRANT_REQUEST,
+      }),
+    ),
   );
   await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`);
   await fillDefaultPreset(page, secret, "Administrator Agent");
   await page.getByRole("button", { name: "Create Agent", exact: true }).click();
-  // Only a member's refusal names an Installation administrator (finding 2113).
-  await page
-    .getByRole("alert")
-    .filter({ hasText: `${CREDENTIAL_ACCESS_UNCONFIRMED} Access denied.` })
-    .waitFor();
+  // Only a member's refusal names an Installation administrator (finding 2113): the
+  // administrator is one, so the whole alert names nobody to ask for the grant (finding 2543).
+  const alert = page.getByRole("alert").filter({ hasText: CREDENTIAL_ACCESS_UNCONFIRMED });
+  await alert.waitFor();
+  const alertText = await alert.textContent();
+  assert.doesNotMatch(alertText ?? "", /Installation administrat/);
+  assert.equal(alertText, ADMINISTRATOR_GRANT_REFUSED);
   assert.equal(await page.getByText(MEMBER_GRANT_REFUSED).count(), 0);
   await waitForEnabled(page.getByRole("button", { name: "Retry credential access", exact: true }));
 });
@@ -418,12 +460,12 @@ test("a member's refused Configuration create and empty Secret list name the acc
   const noConfiguration = await fixture.createNamespaceMember(
     "member-no-configuration",
     namespace.id,
-    MEMBER_WRITE.filter(([action, kind]) => !(action === "create" && kind === "configuration")),
+    memberWriteWithout(["create", "configuration"]),
   );
   const noSecretRead = await fixture.createNamespaceMember(
     "member-no-secret-read",
     namespace.id,
-    MEMBER_WRITE.filter(([action, kind]) => !(action === "read" && kind === "secret")),
+    memberWriteWithout(["read", "secret"]),
   );
 
   const { page } = await newPage(t, fixture);
@@ -477,7 +519,7 @@ test("a member without Secret create sees the inline Create Secret action disabl
   const noSecretCreate = await fixture.createNamespaceMember(
     "member-no-secret-create",
     namespace.id,
-    MEMBER_WRITE.filter(([action, kind]) => !(action === "create" && kind === "secret")),
+    memberWriteWithout(["create", "secret"]),
   );
   const { page } = await newPage(t, fixture);
   const answers = apiResponses(page, fixture.origin);
@@ -507,10 +549,89 @@ test("a member without Secret create sees the inline Create Secret action disabl
   });
   await drawerAction.waitFor();
   assert.equal(await drawerAction.getAttribute("aria-disabled"), "true");
+  // Its hints offer no Secret create either (finding 2483).
+  await drawer
+    .getByText("Choose existing Slack token Secrets before creating the Agent.", { exact: true })
+    .waitFor();
+  assert.equal(await drawer.getByText(/or create/).count(), 0);
   assert.deepEqual(
     answers.filter((answer) => answer.startsWith("POST ") && answer.includes("/secrets")),
     [],
   );
+});
+
+// A Preset's Harness authentication Secret offered "Create new Secret" as its source, and said
+// "Create a new Secret instead", to a member the API would refuse Secret create (finding 2483).
+// The source is listed disabled with the reason, and the field binds an existing Secret.
+test("a Preset's Secret source follows the member's Secret create answer", async (t) => {
+  const { fixture, namespace, secret } = await setup(t);
+  const noSecretCreate = await fixture.createNamespaceMember(
+    "member-preset-no-secret-create",
+    namespace.id,
+    memberWriteWithout(["create", "secret"]),
+  );
+  const preset = await createStandardPreset(fixture, namespace.id);
+  const { page } = await newPage(t, fixture);
+  await login(
+    page,
+    fixture,
+    `/console/agents/new?namespace=${namespace.id}`,
+    noSecretCreate.credentials,
+  );
+  await page.getByLabel("Preset template").selectOption(preset.data.id);
+  const denial = "Your access does not include creating Secrets in this Namespace.";
+  await page.getByText(`Choose an existing Secret. ${denial}`, { exact: true }).waitFor();
+  const source = page.getByLabel("Secret source for Model Secret", { exact: true });
+  assert.equal(await source.inputValue(), "existing");
+  const create = source.locator('option[value="new"]');
+  assert.equal(await create.isDisabled(), true);
+  assert.equal(await create.textContent(), `Create new Secret (${denial})`);
+  const existing = page.getByLabel("Existing Secret for Model Secret", { exact: true });
+  await waitForEnabled(existing);
+  await existing.selectOption(secret.id);
+  await page.getByLabel("Name", { exact: true }).fill("Preset choose-only Agent");
+  await page.getByLabel("Model", { exact: true }).fill("gpt-5.1");
+  await page.getByRole("button", { name: "Use Preset" }).click();
+  await page
+    .getByText("Preset authentication: API key · Secret configured", { exact: true })
+    .waitFor();
+});
+
+// A failed permission read leaves the Secret create answer unknown, not refused: the Preset keeps
+// Create new Secret as its source, and the API decides when the Agent is created. Only a known
+// denial, as above, limits the field to existing Secrets.
+test("an unknown Secret create answer keeps a Preset's Create new Secret", async (t) => {
+  const { fixture, namespace } = await setup(t);
+  const preset = await createStandardPreset(fixture, namespace.id);
+  const { page } = await newPage(t, fixture);
+  // An administrator's form reads the Installation, so it goes on without the permission answer.
+  const permissionsUrl = `${fixture.origin}/namespaces/${namespace.id}/permissions`;
+  await page.route(permissionsUrl, unavailable);
+  const answered = page.waitForResponse(permissionsUrl);
+  await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`);
+  assert.equal((await answered).status(), 503);
+  await page.getByLabel("Preset template").selectOption(preset.data.id);
+  const status = page.locator("#preset-variable-modelSecret-existing-secret-hint");
+  await waitForCondition(
+    async () => (await status.textContent()) !== "Loading existing Secrets…",
+    "the Preset's Secret list loads",
+    10_000,
+  );
+  assert.equal(
+    await status.textContent(),
+    "Existing Secrets in this Namespace are available. Secret values are never shown.",
+  );
+  const source = page.getByLabel("Secret source for Model Secret", { exact: true });
+  assert.equal(await source.inputValue(), "new");
+  const createNew = source.locator('option[value="new"]');
+  assert.equal(await createNew.isDisabled(), false);
+  assert.equal(await createNew.textContent(), "Create new Secret");
+  // The typed key reaches the form's API key field.
+  await page.getByLabel("Name", { exact: true }).fill("Unknown answer Agent");
+  await page.getByLabel("Model", { exact: true }).fill("gpt-5.1");
+  await page.getByLabel("Model Secret", { exact: true }).fill("sk-unknown-answer");
+  await page.getByRole("button", { name: "Use Preset" }).click();
+  assert.equal(await page.getByLabel("API key", { exact: true }).inputValue(), "sk-unknown-answer");
 });
 
 // Agent create needs Secret operate on its Harness authentication Secret and on each Secret its
@@ -519,31 +640,25 @@ test("a member without Secret create sees the inline Create Secret action disabl
 // lists them disabled with the reason and never stages one. The people search field, which only
 // a reader of the Installation sees, is covered in console-agent-plugin-approvers.
 // A member with every Create Agent grant except Secret operate, which it has on the team key
-// only, and a readable spare key it may not operate.
-async function operateSomeSetup(t: TestContext) {
+// only.
+async function operateTeamKeySetup(t: TestContext) {
   const { fixture, namespace, secret } = await setup(t);
-  const spare = await fixture.createSecret(namespace.id, "Spare key", "sk-member-spare");
   const member = await fixture.createNamespaceMember(
     "member-operate-some",
     namespace.id,
-    MEMBER_WRITE.filter(([action, kind]) => !(action === "operate" && kind === "secret")),
+    memberWriteWithout(["operate", "secret"]),
   );
-  fixture.policy.roles.push({
-    id: "role-operate-team-key",
-    namespaceId: namespace.id,
-    permissions: [{ action: "operate", resourceKind: "secret" }],
-  });
-  fixture.policy.bindings.push({
-    id: "binding-operate-team-key",
-    namespaceId: namespace.id,
-    subjectKind: "identity",
-    subjectId: member.principal.id,
-    roleId: "role-operate-team-key",
-    resourceKind: "secret",
-    resourceId: secret.id,
-  });
+  const operate = grantSecretOperate(fixture, namespace.id, member.principal, [secret.id]);
   const answerPath = `/namespaces/${namespace.id}/permissions/secrets`;
-  return { fixture, namespace, secret, spare, member, answerPath };
+  return { fixture, namespace, secret, member, operate, answerPath };
+}
+
+// That member, and a readable spare key it may not operate.
+async function operateSomeSetup(t: TestContext) {
+  const setupResult = await operateTeamKeySetup(t);
+  const { fixture, namespace } = setupResult;
+  const spare = await fixture.createSecret(namespace.id, "Spare key", "sk-member-spare");
+  return { ...setupResult, spare };
 }
 
 test("Create Agent's Secret fields refuse a readable Secret the member cannot operate", async (t) => {
@@ -578,15 +693,26 @@ test("Create Agent's Secret fields refuse a readable Secret the member cannot op
   // The operable key stages as before.
   await selectSecret(page, "API key Secret", secret);
   await staged.waitFor();
+  // Operate is per Secret, so a new Secret would get none: Create new Secret is listed disabled
+  // with the reason the Preset's choice gives, before any Secret is created (finding 2500).
+  const create = await deniedCreateSecretOption(page, "API key Secret", NEW_SECRET_OPERATE_DENIED);
+  await create.click({ force: true });
+  assert.equal(await page.getByRole("dialog").count(), 0);
+  await page.getByLabel("API key Secret", { exact: true }).press("Escape");
 
-  // The Slack token fields in the Channels drawer list it the same way.
+  // The Slack token fields in the Channels drawer list both the same way, and its hint offers no
+  // Secret create.
   await page.getByRole("button", { name: "Configure Slack" }).click();
   const dialog = page.getByRole("dialog", { name: "Configure Slack" });
   for (const label of ["Slack app token", "Slack bot token"]) {
     const option = await operateDeniedSecretOption(dialog, label, spare);
     await option.click({ force: true });
+    await deniedCreateSecretOption(dialog, label, NEW_SECRET_OPERATE_DENIED);
     await dialog.getByLabel(label, { exact: true }).press("Escape");
   }
+  await dialog
+    .getByText("Choose existing Slack token Secrets before creating the Agent.", { exact: true })
+    .waitFor();
   assert.equal(
     await dialog
       .getByText("Secret selected. Apply channel settings, then Create Agent binds it.")
@@ -611,12 +737,7 @@ test("Create Agent's Secret fields refuse a readable Secret the member cannot op
 // disabled with the reason, and Use Preset refuses it, naming why, instead of staging it.
 test("a Preset's existing Secret choice refuses a Secret the member cannot operate", async (t) => {
   const { fixture, namespace, secret, spare, member } = await operateSomeSetup(t);
-  const preset = await fixture.request("POST", `/namespaces/${namespace.id}/presets`, {
-    body: JSON.parse(
-      await readFile(new URL("../../deploy/presets/standard-codex.json", import.meta.url), "utf8"),
-    ),
-  });
-  assert.equal(preset.status, 201, JSON.stringify(preset.body));
+  const preset = await createStandardPreset(fixture, namespace.id);
   const { page } = await newPage(t, fixture);
   await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`, member.credentials);
   await page.getByLabel("Preset template").selectOption(preset.data.id);
@@ -650,22 +771,14 @@ test("a Preset's existing Secret choice refuses a Secret the member cannot opera
 // A refused create can follow a revoked grant, so the form reads the Secret answer again when a
 // field next opens, as the Agent page does after a refused save.
 test("a refused Create reads the Secret answer again", async (t) => {
-  const { fixture, namespace, secret, member, answerPath } = await operateSomeSetup(t);
+  const { fixture, namespace, secret, member, operate, answerPath } = await operateSomeSetup(t);
   const { page } = await newPage(t, fixture);
   const answers = apiResponses(page, fixture.origin);
   await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`, member.credentials);
   await fillDefaultPreset(page, secret, "Refused member Agent");
   // Configuration create and operate on the chosen key are revoked after it is staged.
-  const role = fixture.policy.roles.find((item) => item.id === "role-member-operate-some");
-  assert.ok(role);
-  role.permissions = role.permissions.filter(
-    (permission) =>
-      !(permission.action === "create" && permission.resourceKind === "configuration"),
-  );
-  fixture.policy.bindings.splice(
-    fixture.policy.bindings.findIndex((binding) => binding.id === "binding-operate-team-key"),
-    1,
-  );
+  revokeMemberGrant(fixture, "member-operate-some", ["create", "configuration"]);
+  operate.revoke(secret.id);
   const refused = page.waitForResponse(
     (response) =>
       response.url() === `${fixture.origin}/namespaces/${namespace.id}/configurations` &&
@@ -679,4 +792,149 @@ test("a refused Create reads the Secret answer again", async (t) => {
     answers.filter((answer) => answer.includes(answerPath)),
     [`GET ${answerPath} 200`, `GET ${answerPath} 200`],
   );
+});
+
+// Creating a Secret does not grant operate on it. The field read the operate answer when its list
+// opened, before the new Secret existed, so it staged the Secret and Agent create answered 403
+// (finding 2486). After an inline create the field reads the answer again and refuses the new
+// Secret in place, keeping the key it had. Operate covers every readable Secret, so the answer is
+// empty until the Secret exists and the create action stays enabled (finding 2499).
+test("a Secret created inline that the member cannot operate is not staged", async (t) => {
+  const { fixture, namespace, secret, member, answerPath } = await operateTeamKeySetup(t);
+  const { page } = await newPage(t, fixture);
+  const answers = apiResponses(page, fixture.origin);
+  await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`, member.credentials);
+  await page.getByRole("button", { name: "Start with default Preset", exact: true }).click();
+  await page.getByLabel("Agent name", { exact: true }).fill("Inline member Agent");
+  await selectSecret(page, "API key Secret", secret);
+  const staged = page.getByText("Secret selected. Create Agent binds it.");
+  await staged.waitFor();
+  const field = page.getByLabel("API key Secret", { exact: true });
+  await field.fill("no matching Secret");
+  await page.getByRole("option", { name: "Create new Secret...", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Create model credential Secret" });
+  await dialog.getByLabel("Name", { exact: true }).fill("Inline member key");
+  await dialog.getByLabel("Value", { exact: true }).fill("sk-inline-member");
+  await dialog.getByRole("button", { name: "Create Secret", exact: true }).click();
+  await dialog.waitFor({ state: "detached" });
+  await page
+    .getByText(`Inline member key cannot be chosen. ${SECRET_OPERATE_DENIED}`, { exact: true })
+    .waitFor();
+  assert.equal(await field.inputValue(), secret.name);
+  // The answer was read when the list opened and again after the create.
+  assert.deepEqual(
+    answers.filter((answer) => answer.includes(answerPath)),
+    [`GET ${answerPath} 200`, `GET ${answerPath} 200`],
+  );
+  // The new Secret is listed disabled with the reason.
+  const list = await fixture.request("GET", `/namespaces/${namespace.id}/secrets`);
+  const created = (list.data as SecretWire[]).find((item) => item.name === "Inline member key");
+  assert.ok(created);
+  await operateDeniedSecretOption(page, "API key Secret", created);
+  await field.press("Escape");
+  // The only write is the Secret create.
+  assert.deepEqual(
+    answers.filter((answer) => !answer.startsWith("GET ") && !answer.includes("/auth/")),
+    [`POST /namespaces/${namespace.id}/secrets 201`],
+  );
+});
+
+// The Preset's Create new Secret choice saves the typed key as a new Secret when Create Agent is
+// pressed, and the next requests bind it. Creating a Secret grants no Secret operate on it, so
+// this member met a 403 from Agent create after the Secret and Configuration were saved
+// (finding 2492). Its operate is per Secret (one readable Secret is denied), so the choice is
+// listed disabled with the reason, and a typed key is refused before any write.
+test("a member whose Secret operate covers only some Secrets cannot save a typed model key", async (t) => {
+  const { fixture, namespace, spare, member, answerPath } = await operateSomeSetup(t);
+  const preset = await createStandardPreset(fixture, namespace.id);
+  const { page } = await newPage(t, fixture);
+  const answers = apiResponses(page, fixture.origin);
+  await login(page, fixture, `/console/agents/new?namespace=${namespace.id}`, member.credentials);
+  await page.getByLabel("Preset template").selectOption(preset.data.id);
+  await page.getByLabel("Name", { exact: true }).fill("Typed key Agent");
+  await page.getByLabel("Model", { exact: true }).fill("gpt-5.1");
+  const source = page.getByLabel("Secret source for Model Secret", { exact: true });
+  const status = page.locator("#preset-variable-modelSecret-existing-secret-hint");
+  await waitForCondition(
+    async () => (await status.textContent()) !== "Loading existing Secrets…",
+    "the Preset's Secret list loads",
+    10_000,
+  );
+  // Namespace Roles grant Secret operate per Secret, so the remedy names that grant, not one
+  // across the Namespace (finding 2507).
+  assert.equal(
+    await status.textContent(),
+    `Choose an existing Secret. ${NEW_SECRET_OPERATE_DENIED} ${NEW_SECRET_OPERATE_REMEDY}`,
+  );
+  const createNew = source.locator('option[value="new"]');
+  assert.equal(await createNew.isDisabled(), true);
+  assert.equal(await createNew.textContent(), `Create new Secret (${NEW_SECRET_OPERATE_DENIED})`);
+  assert.equal(await source.inputValue(), "existing");
+  // A choice the list cannot offer, as a scripted value, reaches the form's API key field; Create
+  // Agent refuses the typed key before the preflight or any write.
+  await source.evaluate((select: HTMLSelectElement) => {
+    select.value = "new";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await page.getByLabel("Model Secret", { exact: true }).fill("sk-typed-key");
+  await page.getByRole("button", { name: "Use Preset" }).click();
+  assert.equal(await page.getByLabel("API key", { exact: true }).inputValue(), "sk-typed-key");
+  const submit = page.getByRole("button", { name: "Create Agent", exact: true });
+  const refusal = page.getByText(
+    `${NEW_SECRET_OPERATE_DENIED} Select Start over and use an existing Secret. ${NEW_SECRET_OPERATE_REMEDY}`,
+    { exact: true },
+  );
+  await submit.click();
+  await refusal.waitFor();
+  const writes = () =>
+    answers.filter((answer) => !answer.startsWith("GET ") && !answer.includes("/auth/"));
+  assert.deepEqual(writes(), []);
+
+  // A retry whose fresh read fails (an IAM outage answers 503) keeps the last answer and is
+  // refused too. The failed read used to stand for an unknown answer for the whole page, so the
+  // key was saved and Agent create answered 403, and every field forgot its marks (finding 2501).
+  const answerUrl = `${fixture.origin}${answerPath}`;
+  await page.route(answerUrl, unavailable);
+  const failedRead = page.waitForResponse((response) => response.url() === answerUrl);
+  await waitForEnabled(submit);
+  await submit.click();
+  assert.equal((await failedRead).status(), 503);
+  await refusal.waitFor();
+  assert.deepEqual(writes(), []);
+  // While reads still fail, a Slack token field keeps the last answer's marks, and asks again
+  // rather than reusing the failed read.
+  const failedReads = () => answers.filter((answer) => answer === `GET ${answerPath} 503`).length;
+  await page.getByRole("button", { name: "Configure Slack" }).click();
+  const dialog = page.getByRole("dialog", { name: "Configure Slack" });
+  const botToken = dialog.getByLabel("Slack bot token", { exact: true });
+  await operateDeniedSecretOption(dialog, "Slack bot token", spare);
+  await deniedCreateSecretOption(dialog, "Slack bot token", NEW_SECRET_OPERATE_DENIED);
+  await waitForCondition(async () => failedReads() >= 2, "the field reads the answer again");
+  await botToken.press("Escape");
+
+  // An administrator grants Secret operate across the Namespace, which covers a new Secret too.
+  // The next answer read replaces the marks: the spare key is choosable again.
+  await page.unroute(answerUrl, unavailable);
+  grantMember(fixture, "member-operate-some", [["operate", "secret"]]);
+  await botToken.fill(spare.name);
+  const spareOption = dialog.getByRole("option", { name: spare.name, exact: true });
+  await spareOption.waitFor();
+  assert.equal(await spareOption.getAttribute("aria-disabled"), null);
+  await botToken.press("Escape");
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  // The retry reads the answer again, saves the key as a Secret, and Agent create binds it.
+  const createdResponse = page.waitForResponse(
+    (response) =>
+      response.url() === `${fixture.origin}/namespaces/${namespace.id}/agents` &&
+      response.request().method() === "POST",
+  );
+  await waitForEnabled(submit);
+  await submit.click();
+  const response = await createdResponse;
+  assert.equal(response.status(), 201);
+  const { data: created }: AgentResponse = await response.json();
+  const secrets = await fixture.request("GET", `/namespaces/${namespace.id}/secrets`);
+  const saved = (secrets.data as SecretWire[]).find((item) => item.name === "Typed key Agent");
+  assert.ok(saved);
+  assert.deepEqual(created.harnessAuth, { method: "api_key", source: saved.ref });
 });
