@@ -110,9 +110,11 @@ See the [parent flow](../platform-console.md#3-authorize-the-selected-page-resou
 ## Debugging and Verification
 
 The focused cases in `tests/browser/console.test.mjs` exercise the console
-against controller sessions and resource reads. Their external provider exchange
-and recovery endpoint are modeled; they do not establish a deployed OAuth or
-native-gateway integration.
+against controller sessions and resource reads. The external-provider cases
+model their provider exchange, while the readable-Agent native-return case
+intercepts the return lookup. The restricted-account cases use the local
+Controller for return resolution and native-admin status. They do not establish
+a deployed OAuth or native-gateway integration.
 
 ## Related docs
 

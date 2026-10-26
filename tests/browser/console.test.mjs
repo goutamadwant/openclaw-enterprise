@@ -2576,7 +2576,7 @@ test("login ignores untrusted returns and resolves an opaque Agent key only afte
   await page.getByRole("button", { name: "Sign in" }).click();
   await page.waitForURL(`**/console/agents/${agent.id}?namespace=${namespace.id}`);
   await page.getByRole("heading", { name: "Shared Agent", exact: true }).waitFor();
-  assert.equal(await page.getByRole("heading", { name: "Agent native administration" }).count(), 0);
+  assert.equal(await page.getByRole("heading", { name: "Native admin UI" }).count(), 0);
   assert.equal(lookups, 1);
   await page.goto(`${fixture.origin}/console/`);
   await page.waitForURL(/\/console\/agents(?:\?|$)/);
