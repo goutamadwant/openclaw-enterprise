@@ -69,15 +69,19 @@ import {
 } from "./console-agents-test-support.mjs";
 import {
   AGENT_SAVE_DENIED,
+  AGENT_SOURCES_DENIED,
+  askForGrant,
+  callerDenied,
   CONFIGURATION_EDITS_PENDING,
+  CONFIGURATION_UPDATE_DENIED,
   CONFIGURATION_SAVE_DENIED,
-  CONSOLE_ACCESS_DENIED,
   NAMESPACE_NOT_READY,
   NEW_SECRET_OPERATE_DENIED,
   NEW_SECRET_OPERATE_REMEDY,
   READ_UNAVAILABLE,
   RESOURCE_CONFLICT,
   SAVED_CONFIGURATION_CHANGED,
+  SECRET_CREATE_DENIED,
   SECRET_NAME_CONFLICT,
   SECRET_OPERATE_DENIED,
   WORKSPACE_FILES_UNAVAILABLE,
@@ -2267,7 +2271,6 @@ test("a different Secret in a create response cannot stage a binding or repeat t
 // The Secrets page disables Create Secret when the Namespace's permission answer denies Secret
 // create; the inline Create Secret action in the Credentials tab offered the same refused write
 // (finding 2442). It stays listed, disabled with the reason, until a grant.
-const SECRET_CREATE_DENIED = "Your access does not include creating Secrets in this Namespace.";
 test("the Credentials tab's inline Create Secret follows the Secret create answer", async (t) => {
   const fixture = await createConsoleAppFixture(t);
   await fixture.bootstrap();
@@ -2504,12 +2507,7 @@ test("Agent credential Secret picker searches, validates, and preserves duplicat
   conflictCode = "FORBIDDEN";
   await dialog.getByLabel("Name", { exact: true }).fill("Denied picker Secret");
   await dialog.getByRole("button", { name: "Create Secret", exact: true }).click();
-  await dialog
-    .getByRole("alert")
-    .filter({
-      hasText: "Access denied. You do not have permission to manage this Secret binding.",
-    })
-    .waitFor();
+  await dialog.getByRole("alert").filter({ hasText: SECRET_CREATE_DENIED }).waitFor();
   await waitForEnabled(dialog.getByLabel("Name", { exact: true }));
   assert.equal(
     await dialog.getByLabel("Value", { exact: true }).inputValue(),
@@ -2624,11 +2622,12 @@ test("Agent credentials report partial harness Secret grant failure", async (t) 
   });
   requests.length = 0;
   await page.getByRole("button", { name: "Retry credential access" }).click();
-  // The read's own refusal, not grant advice such as "this write may have succeeded".
+  // The read's own refusal, named by the API (finding 2534), not grant advice such as "this
+  // write may have succeeded".
   await page
     .getByText(
       new RegExp(
-        `^${escapeRegExp(`Authentication source saved, but this Agent could not be read before retrying its credential access. ${CONSOLE_ACCESS_DENIED}`)} Request ID: req_[0-9a-f-]{36} Select Retry credential access once the Agent can be read\\.$`,
+        `^${escapeRegExp(`Authentication source saved, but this Agent could not be read before retrying its credential access. ${callerDenied("Agent read", `Agent ${agent.id}`)}`)} Request ID: req_[0-9a-f-]{36} Select Retry credential access once the Agent can be read\\.$`,
       ),
     )
     .waitFor();
@@ -3925,7 +3924,7 @@ for (const viewport of [
 
     // An empty Namespace does not invite creating under the note.
     await page.goto(`${fixture.origin}/console/agents?namespace=${empty.id}`);
-    await page.getByRole("heading", { name: "No Agents yet" }).waitFor();
+    await page.getByRole("heading", { name: "No Agents are shared with you" }).waitFor();
     await note.waitFor();
     await page
       .getByText("Agents in this Namespace that are shared with you appear here.")
@@ -4085,10 +4084,9 @@ test("a version editor without Agent update can recover a failed deployment from
 });
 
 // The Agent page's copy for a caller without Configuration update (finding 2421).
-const CONFIGURATION_READ_ONLY = "Your access does not include editing this Configuration.";
+const CONFIGURATION_READ_ONLY = CONFIGURATION_UPDATE_DENIED;
 const CHANNELS_READ_ONLY = `These are the version draft’s channel settings. ${CONFIGURATION_READ_ONLY}`;
-const CONFIGURATION_SECRETS_READ_ONLY =
-  "Saving this Configuration needs Secret operate on each Secret it binds, which your access does not include.";
+const CONFIGURATION_SECRETS_READ_ONLY = `Saving this Configuration needs Secret operate on each Secret it binds, which your access does not include. ${askForGrant("Secret operate on each of them")}`;
 // A channel save keeps a binding whose Secret the member may not operate (finding 2444).
 const KEPT_SECRET_CHANNEL_SECRETS =
   "Each Configuration save needs Secret operate on every Secret it keeps bound. Your access does not include it for EXTERNAL_API_TOKEN, which channel saves keep.";
@@ -4098,8 +4096,6 @@ const KEEPS_BOT_TOKEN =
   "This save keeps Slack bot token on a Secret your access cannot operate. Choose another Secret for it, then save.";
 const DISABLE_KEEPS_BOT_TOKEN =
   "Disabling keeps Slack bot token on a Secret your access cannot operate. Choose another Secret for it in Edit Slack first, then disable.";
-const AGENT_SOURCES_DENIED =
-  "Saving these settings needs operate on each Secret and credential source this Agent and its Configuration bind, which your access does not include. Ask an administrator for that access.";
 // Slack Socket Mode reading its tokens from SLACK_APP_TOKEN and SLACK_BOT_TOKEN, which a test
 // binds to Secrets or leaves unbound.
 const SOCKET_SLACK = {

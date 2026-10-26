@@ -11,6 +11,11 @@ export class AuthorizationDeniedError extends Error {
     readonly action: AuthorizationRequest["action"];
     readonly resource: ResourceRef;
   };
+  /**
+   * The principal whose grant was checked. HTTP names the missing grant only when it is the
+   * caller, since IAM Drivers need not report it in `evidence` (finding 2586).
+   */
+  readonly checkedPrincipalId?: string;
 
   constructor(
     message = "The exact platform operation was not authorized.",
@@ -19,6 +24,7 @@ export class AuthorizationDeniedError extends Error {
       readonly action: AuthorizationRequest["action"];
       readonly resource: ResourceRef;
     },
+    checkedPrincipalId?: string,
   ) {
     super(message);
     this.name = "AuthorizationDeniedError";
@@ -33,16 +39,31 @@ export class AuthorizationDeniedError extends Error {
         resource: Object.freeze({ ...authorization.resource }),
       });
     }
+    if (checkedPrincipalId !== undefined) {
+      this.checkedPrincipalId = checkedPrincipalId;
+    }
   }
 }
 
 /**
- * The Agent's own service principal, not the caller, lacks a grant that deployment needs.
- * The caller is already authorized for the Agent, so naming the principal and the missing
- * grant tells an operator exactly what to bind without disclosing anything new.
+ * A denial about the caller's own account, session or role in a job, not a missing grant: a
+ * disabled account, a session that is no longer current, or another actor's provisioning job.
+ * Its message is fixed text about the caller's own state, so HTTP returns it as written.
+ */
+export class CallerStateDeniedError extends AuthorizationDeniedError {}
+
+/**
+ * The Agent's own service principal, not the caller, lacks a grant that deployment needs. The
+ * message names that principal for audit. HTTP answers with its own text instead, which names
+ * the resource only when the caller sent its ID or may read it (`callerMayReadResource`), since the
+ * resource comes from the Agent's stored bindings (finding 2592).
  */
 export class AgentPrincipalAuthorizationError extends AuthorizationDeniedError {
   readonly principalId: string;
+  /** The Agent whose principal was denied, when the check knew it. */
+  readonly agentId?: string;
+  /** Whether the caller may read the denied resource, checked when the denial was raised. */
+  readonly callerMayReadResource: boolean;
   declare readonly authorization: {
     readonly action: AuthorizationRequest["action"];
     readonly resource: ResourceRef;
@@ -53,6 +74,7 @@ export class AgentPrincipalAuthorizationError extends AuthorizationDeniedError {
     action: AuthorizationRequest["action"],
     resource: ResourceRef,
     evidence?: AuthorizationEvidence,
+    context: { readonly agentId?: string; readonly callerMayReadResource?: boolean } = {},
   ) {
     super(
       `The Agent service principal ${principalId} is not authorized to ${action} ${resource.kind} ${resource.id}. Grant that principal ${action} on the ${resource.kind}, then deploy again.`,
@@ -61,6 +83,10 @@ export class AgentPrincipalAuthorizationError extends AuthorizationDeniedError {
     );
     this.name = "AgentPrincipalAuthorizationError";
     this.principalId = principalId;
+    if (context.agentId !== undefined) {
+      this.agentId = context.agentId;
+    }
+    this.callerMayReadResource = context.callerMayReadResource === true;
   }
 }
 

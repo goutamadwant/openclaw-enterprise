@@ -105,6 +105,7 @@ import {
 } from "./gateway/contracts.ts";
 import type { NativeAdminAccessConfig } from "./gateway/native-admin.ts";
 import { createAgentHandlers } from "./http/agents.ts";
+import { callerDenialMessage, GENERIC_DENIAL, requestedValues } from "./http/caller-denial.ts";
 import { configurationHandlers } from "./http/configurations.ts";
 import { credentialSourceHandlers } from "./http/credential-sources.ts";
 import { jsonPointer, type ErrorDetail } from "./http/error-details.ts";
@@ -1581,7 +1582,11 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
     }
     if (!decision.allowed) {
       await denial(operation, request, "authorization_denial", context, decision.evidence);
-      throw failure(403, "FORBIDDEN", "The exact platform operation was not authorized.");
+      throw failure(
+        403,
+        "FORBIDDEN",
+        callerDenialMessage({ action: "administer", resource: target }),
+      );
     }
     return { selected, target, decision };
   }
@@ -1941,7 +1946,7 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
           identity.subject !== admitted.externalIdentity.subject)
     ) {
       await denial(operation, request, "authorization_denial");
-      throw failure(403, "FORBIDDEN", "The exact platform operation was not authorized.");
+      throw failure(403, "FORBIDDEN", GENERIC_DENIAL);
     }
 
     const context: RequestContext = {
@@ -2585,10 +2590,34 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
       // it (finding 2546). Only a caller who may make such a save or deployment gets an answer,
       // so it reports nothing that request would not, and only on the Secrets the caller may
       // list.
-      const operateDenied =
-        namespaceRead && configurationRead && (configurationUpdate || update || deploy)
+      const mayBind = configurationUpdate || update;
+      const listed =
+        namespaceRead && configurationRead && (mayBind || deploy)
           ? await controller.listSecretsOperateDenied(context.actorId, namespaceId)
           : [];
+      // A deployment checks only the Secrets the draft binds now: its Configuration's Secret
+      // bindings and a Secret Harness authentication source. A caller who may deploy but bind
+      // nothing learns only those, which the Agent and Configuration reads already name
+      // (finding 2565).
+      let operateDenied = listed;
+      if (!mayBind && listed.length > 0) {
+        const bound = new Set(
+          Object.values(
+            await controller.getConfigurationSecretBindingSources(
+              context.actorId,
+              namespaceId,
+              agent.configurationId,
+            ),
+          )
+            .filter((source) => source.kind === "secret")
+            .map((source) => source.id),
+        );
+        // Unreadable saved settings hide the Agent's sources, so the answer leaves them out.
+        if (!("configurationReadError" in agent) && isSecretHarnessAuth(agent.harnessAuth)) {
+          bound.add(agent.harnessAuth.source.id);
+        }
+        operateDenied = listed.filter((id) => bound.has(id));
+      }
       reply.send({ data: { operateDenied }, meta: { requestId: request.id } });
       return;
     }
@@ -2603,9 +2632,6 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
       const deadline = new Date(Date.now() + deadlineMs);
       try {
         requireWorkspaceFileCsrf(request, operation.operationId === "putAgentWorkspaceFile");
-        if (options.workspaceFilesAccess === undefined) {
-          throw dependencyUnavailable();
-        }
         const filename = params.name;
         if (filename === undefined || !isAllowedWorkspaceFileName(filename)) {
           throw failure(
@@ -2624,7 +2650,9 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
             : controller.getOperableActiveAgentRevision(context.actorId, namespaceId, agentId),
         );
         const target = { kind: "agent" as const, id: agent.id, namespaceId: agent.namespaceId };
-        if (signal.aborted) {
+        // After authorization, so a caller without the grant gets its 403, not this 503
+        // (finding 2584).
+        if (options.workspaceFilesAccess === undefined || signal.aborted) {
           throw dependencyUnavailable();
         }
 
@@ -4324,8 +4352,48 @@ export function createFastifyApp(options: ControllerAppOptions): FastifyInstance
     );
   });
 
+  /**
+   * Which IDs a caller's own denial may name: those the request carried and, for a resource read
+   * from stored state, such as a Secret the Agent binds, that resource when the caller may already
+   * read it (finding 2594). Only the caller's own denial of an action other than read or create
+   * asks; an IAM failure while asking only hides the ID.
+   */
+  async function nameableIds(
+    error: unknown,
+    actorId: string | undefined,
+    sent: (value: string) => boolean,
+  ): Promise<(value: string) => boolean> {
+    if (
+      actorId === undefined ||
+      !isAuthorizationDenied(error) ||
+      isDependencyUnavailable(error) ||
+      error instanceof AgentPrincipalAuthorizationError ||
+      error.authorization === undefined ||
+      error.checkedPrincipalId !== actorId
+    ) {
+      return sent;
+    }
+    const { action, resource } = error.authorization;
+    if (
+      action === "read" ||
+      action === "create" ||
+      resource.kind === "installation" ||
+      sent(resource.id)
+    ) {
+      return sent;
+    }
+    const readable = await callerMay(actorId, "read", resource).catch(() => false);
+    return readable ? (value) => value === resource.id || sent(value) : sent;
+  }
+
   app.setErrorHandler(async (error, request, reply) => {
-    let mapped = requestFailure(error);
+    // A caller's own denial names a resource ID only when this request carried it or the caller
+    // may already read that resource.
+    const actorId = contexts.get(request)?.actorId;
+    let mapped = requestFailure(error, {
+      requested: await nameableIds(error, actorId, requestedValues(request)),
+      ...(actorId === undefined ? {} : { actorId }),
+    });
     if (error instanceof RuntimeLogsError && error.retryAfterSeconds !== undefined) {
       reply.header("retry-after", String(error.retryAfterSeconds));
     }

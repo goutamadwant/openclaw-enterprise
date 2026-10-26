@@ -52,7 +52,7 @@ import {
 } from "./console-deployment-activity-helpers.mjs";
 import { createRuntimeAuthFixture } from "./console-agents-runtime-auth-fixture.mjs";
 import { fileReadyNamespace } from "./console-ready-namespace.mjs";
-import { CONFIGURATION_EDITS_PENDING } from "../helpers/refusal-text.mjs";
+import { CONFIGURATION_EDITS_PENDING, LOG_TEXT_DENIED } from "../helpers/refusal-text.mjs";
 
 // The Agent page's first screen while its reads settle and its polls run: loading cues, quiet
 // polls, a steady layout, and failed-version recovery scoped to the caller.
@@ -317,7 +317,7 @@ test("A failed older version raises no recovery while the current version is hid
   await page
     .locator(".agent-status-line")
     .getByText(
-      /The current version, rev_.*, is one you cannot read, so this page cannot tell whether the failed v1 deployment affects it\. Ask an Agent administrator for read access/,
+      /The current version, rev_.*, is one you cannot read, so this page cannot tell whether the failed v1 deployment affects it\. Each new version needs its own AgentRevision read/,
     )
     .waitFor();
   assert.equal(await page.locator(".deployment-recovery").isHidden(), true);
@@ -451,6 +451,32 @@ test("Stop is disabled with its reason when a failed first deployment left nothi
     await stopRegion.getByRole("button", { name: "Stop Agent", exact: true }).isDisabled(),
     true,
   );
+});
+
+// The Agents list follows the detail page: once the row's deployment read shows the failed first
+// deployment, the row offers no Stop, while Delete stays (catalog rows 49 and 58, finding 2548).
+test("the Agents list hides Stop when a failed first deployment left nothing running", async (t) => {
+  const { fixture, namespace, agent, page } = await agentPage(t, "Failed list", "Failed list");
+  const failed = await fixture.deployAgent(namespace.id, agent.id);
+  await routeFailedRecord(page, fixture, namespace, agent, failed);
+
+  await login(page, fixture, `/console/agents?namespace=${namespace.id}`);
+  const row = page.getByRole("row").filter({ hasText: "Failed list" });
+  await row.getByText("v1 · Failed", { exact: true }).waitFor();
+  await waitForEnabled(row.getByRole("button", { name: "Delete Failed list", exact: true }));
+  assert.equal(await row.getByRole("button", { name: "Stop Failed list", exact: true }).count(), 0);
+
+  // Deploy again from the Agent page, then Back: the retained list rereads the row's deployment,
+  // and a retried first deployment that is queued keeps Stop, as on Agent detail (finding 2580).
+  await row.getByRole("link", { name: "Failed list", exact: true }).click();
+  await page.getByRole("region", { name: "Agent state at a glance" }).waitFor();
+  const retried = await fixture.deployAgent(namespace.id, agent.id);
+  await page.route(deploymentRecordUrl(fixture, namespace.id, agent.id, retried.id), (route) =>
+    route.fulfill(deploymentStatusResponse(retried, { status: "queued" })),
+  );
+  await page.goBack();
+  await row.getByText("v2 · Queued", { exact: true }).waitFor();
+  await waitForEnabled(row.getByRole("button", { name: "Stop Failed list", exact: true }));
 });
 
 // Only a failed first deployment leaves nothing to stop. While a first deployment is still queued
@@ -973,7 +999,7 @@ test("A failed version raises no recovery while the current version is on no loa
   assert.equal(await page.getByRole("button", { name: "Show older versions" }).count(), 0);
   await statusLine
     .getByText(
-      /The current version, rev_.*, is one you cannot read, so this page cannot tell whether the failed v2 deployment affects it\. Ask an Agent administrator for read access/,
+      /The current version, rev_.*, is one you cannot read, so this page cannot tell whether the failed v2 deployment affects it\. Each new version needs its own AgentRevision read/,
     )
     .waitFor();
   assert.equal(await page.locator(".deployment-recovery").isHidden(), true);
@@ -1132,9 +1158,7 @@ test("Recovery stops offering a failed version's Logs once this page saw log tex
     )
     .waitFor();
   await recovery.getByRole("link", { name: "Open v2 Logs" }).click();
-  await page
-    .getByText("Log text requires Agent read_logs (or administer) and read access.")
-    .waitFor();
+  await page.getByText(LOG_TEXT_DENIED).waitFor();
 
   // The denial updates the recovery at once: it says who can check the logs instead of
   // steering the reader into another denied read.
@@ -1195,9 +1219,7 @@ test("A replaced current version still says who can check the logs once Logs is 
   assert.equal(await recovery.locator(".status-label").textContent(), "Deployment failed · v2");
   assert.equal(await recovery.locator(".status-label").isVisible(), true);
   await recovery.getByRole("link", { name: "Open v2 Logs" }).click();
-  await page
-    .getByText("Log text requires Agent read_logs (or administer) and read access.")
-    .waitFor();
+  await page.getByText(LOG_TEXT_DENIED).waitFor();
   await recovery
     .getByText(
       `v2 failed its startup model check (RUNTIME_MODEL_PROBE_FAILED). v1 is still selected, but its runtime was probably stopped for this deployment. ${PROBE_FAILED_MESSAGE} Ask someone with log access to check the failed version’s logs.`,

@@ -9,6 +9,7 @@ import {
 } from "./agents.mjs";
 import { clearRuntimeDenials, forgetRuntimeDenials } from "./agents/logs.mjs";
 import { renderNativeAdminAccess } from "./agents/native-admin.mjs";
+import { ASK_INSTALLATION_ADMINISTRATOR, askForGrant } from "./agents/access-reasons.mjs";
 import { createApiClient } from "./api-client.mjs";
 import { createViewLifetime } from "./view-lifetime.mjs";
 import { createNavigation, pages } from "./navigation.mjs";
@@ -281,7 +282,7 @@ function providerExchangeFailure(error, label) {
 // The provider authenticated an identity attached to a disabled account. Retrying, a
 // password or an attach cannot help, so only an administrator is named.
 function accountDisabledFailure(label) {
-  return `Your account is disabled, so you cannot sign in with ${label}. Ask an administrator to enable it.`;
+  return `Your account is disabled, so you cannot sign in with ${label}. Ask an Installation administrator to enable it.`;
 }
 
 // Only a tab that had a session says it expired; a first visit to a deep link, or one after
@@ -569,7 +570,7 @@ function namespaceUnavailablePanel(view, unavailableId) {
   panel(
     view,
     "Namespace unavailable",
-    `${why}, and you cannot read any other Namespace. Ask an administrator to grant you access to one, then Refresh.`,
+    `${why}, and you cannot read any other Namespace. Ask an Installation administrator to give you access to one, then Refresh.`,
   );
 }
 const request = createApiClient({
@@ -1993,7 +1994,7 @@ async function loadPage({
         panel(
           shell.view,
           "No readable Namespaces",
-          "Ask an administrator to create a Namespace or grant you access to one, then Refresh.",
+          "Ask an Installation administrator to create a Namespace or to give you access to one, then Refresh.",
         );
       } else {
         namespaceUnavailablePanel(shell.view, namespaceId);
@@ -2389,14 +2390,16 @@ async function loadPage({
       shell.view,
       title,
       agentDenied
-        ? "You do not have access to this Agent or its settings, or it was deleted. Ask its owner to share it with you."
+        ? `You do not have access to this Agent or its settings, or it was deleted. ${askForGrant("Agent read on it")}`
         : installationDenied
-          ? "Your account does not have access to Backends. Backends apply to the whole Installation, so choosing another Namespace would not change this. Ask an Installation administrator for access."
+          ? `Your account does not have access to Backends. Backends apply to the whole Installation, so choosing another Namespace would not change this. ${askForGrant("access")}`
           : error.status === 403
-            ? "Your account does not have access to this page in this Namespace. Ask an administrator for access, or choose another Namespace."
+            ? `Your account does not have access to this page in this Namespace. Choose another Namespace, or ${ASK_INSTALLATION_ADMINISTRATOR} for access.`
             : "The read could not be completed. Retry to check current access and saved state.",
-      "Retry",
-      () => void loadPage(),
+      // Retrying a permission refusal gives the same answer; the header's Refresh checks access
+      // again after a grant (finding 2549). The Request ID stays for whoever traces the denial.
+      error.status === 403 ? undefined : "Retry",
+      error.status === 403 ? undefined : () => void loadPage(),
       error.requestId,
     );
   } finally {
@@ -2604,12 +2607,16 @@ async function revalidateMountedAgent(current) {
           ? "Resource unavailable"
           : "Request unavailable",
       error.status === 403
-        ? "You do not have permission to read this Agent, its versions, or its Configuration."
+        ? `You do not have permission to read this Agent, its versions, or its Configuration. ${askForGrant("read access to them")}`
         : "The read could not be completed. Retry to check current access and saved state.",
-      "Retry",
-      () => void loadPage(),
+      // A permission refusal offers the header's Refresh, not a Retry that repeats it.
+      error.status === 403 ? undefined : "Retry",
+      error.status === 403 ? undefined : () => void loadPage(),
       error.requestId,
     );
+    if (error.status === 403) {
+      shell.refresh.disabled = false;
+    }
   } finally {
     clearTimeout(stillChecking);
     clearStillChecking?.();

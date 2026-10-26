@@ -256,6 +256,7 @@ import {
   AgentDeletingError,
   AgentPrincipalAuthorizationError,
   AuthorizationDeniedError,
+  CallerStateDeniedError,
   DEDICATED_OPENCLAW_SANDBOX_REQUIRED,
   DedicatedOpenClawSandboxError,
   DeletionRetryOwnedError,
@@ -408,6 +409,7 @@ export {
   AgentDeletingError,
   AgentPrincipalAuthorizationError,
   AuthorizationDeniedError,
+  CallerStateDeniedError,
   DEDICATED_OPENCLAW_SANDBOX_REQUIRED,
   DedicatedOpenClawSandboxError,
   DeletionRetryOwnedError,
@@ -3191,10 +3193,8 @@ export class OpenClawController {
         principalId,
         namespace.id,
         workId,
+        "Only the initiating actor can retry provisioning.",
       );
-      if (record.actorId !== principalId) {
-        throw new AuthorizationDeniedError("Only the initiating actor can retry provisioning.");
-      }
       const agent =
         record.agentId === undefined
           ? undefined
@@ -3999,6 +3999,7 @@ export class OpenClawController {
         : "The exact operation was denied.",
       delegated.decision.evidence,
       { action: "read_logs", resource: agent },
+      principalId,
     );
   }
 
@@ -9751,7 +9752,7 @@ export class OpenClawController {
       const secretDriver =
         Object.keys(secretBindings).length === 0 ? undefined : this.secretDriver();
       for (const secret of sources) {
-        await this.authorizeAgentPrincipal(lockedAgent.servicePrincipalId, "operate", {
+        await this.authorizeAgentPrincipal(principalId, lockedAgent, "operate", {
           kind: "secret",
           id: secret.id,
           namespaceId: namespace.id,
@@ -10864,25 +10865,39 @@ export class OpenClawController {
           : "The exact operation was denied.",
         authorization.decision.evidence,
         { action, resource },
+        principalId,
       );
     }
     return authorization;
   }
 
-  /** Authorizes an Agent's own service principal and names it and the grant when denied. */
+  /**
+   * Authorizes an Agent's own service principal and names it and the grant when denied. The
+   * resource comes from the Agent's stored bindings, so the denial records whether the caller
+   * may read it: HTTP names it only then, or when the request sent its ID (finding 2592).
+   */
   private async authorizeAgentPrincipal(
-    principalId: string,
+    callerId: string,
+    agent: Pick<Agent, "id" | "servicePrincipalId">,
     action: AuthorizationRequest["action"],
     resource: ResourceRef,
   ): Promise<void> {
     try {
-      await this.authorize(principalId, action, resource);
+      await this.authorize(agent.servicePrincipalId, action, resource);
     } catch (error) {
       if (
         error instanceof AuthorizationDeniedError &&
         !(error instanceof DependencyUnavailableError)
       ) {
-        throw new AgentPrincipalAuthorizationError(principalId, action, resource, error.evidence);
+        // An outage while checking the caller's read only hides the ID.
+        const callerMayReadResource = await this.canRead(callerId, resource).catch(() => false);
+        throw new AgentPrincipalAuthorizationError(
+          agent.servicePrincipalId,
+          action,
+          resource,
+          error.evidence,
+          { agentId: agent.id, callerMayReadResource },
+        );
       }
       throw error;
     }
@@ -11038,7 +11053,7 @@ export class OpenClawController {
 
   private authorizationAuthority(principalId: string): IAMDriver {
     if (!isNonEmptyString(principalId)) {
-      throw new AuthorizationDeniedError("The acting identity is unavailable.");
+      throw new CallerStateDeniedError("The acting identity is unavailable.");
     }
     try {
       return this.selectedDriver("iam");
@@ -11427,7 +11442,7 @@ export class OpenClawController {
     );
     const snapshots: CredentialSourceSnapshot[] = [];
     for (const { sourceId } of bindings) {
-      await this.authorizeAgentPrincipal(agent.servicePrincipalId, "operate", {
+      await this.authorizeAgentPrincipal(principalId, agent, "operate", {
         kind: "credential_source",
         namespaceId: agent.namespaceId,
         id: sourceId,
@@ -11660,6 +11675,8 @@ export class OpenClawController {
     principalId: string,
     namespaceId: string,
     workId: string,
+    // What another actor is told: a retry says so, a status read says so (finding 2588).
+    otherActorDenial = "Only the initiating actor can read provisioning status.",
   ) {
     if (!isNonEmptyString(workId)) {
       throw new ScopeViolationError("The exact provisioning work identity is missing.");
@@ -11673,7 +11690,7 @@ export class OpenClawController {
       );
     }
     if (found.record.actorId !== principalId) {
-      throw new AuthorizationDeniedError("Only the initiating actor can read provisioning status.");
+      throw new CallerStateDeniedError(otherActorDenial);
     }
     // Retry repeats the full check, native support, plugin policy, the Compute plan and Harness
     // authentication checks included, after its lifecycle checks.
@@ -12727,7 +12744,7 @@ export class OpenClawController {
       return immutableCopy(binding);
     }
     if (isSecretHarnessAuth(binding)) {
-      await this.authorizeAgentPrincipal(agent.servicePrincipalId, "operate", binding.source);
+      await this.authorizeAgentPrincipal(principalId, agent, "operate", binding.source);
       const source = await state.secrets.lockSecret(agent.namespaceId, binding.source.id);
       if (source === undefined) {
         throw new ScopeViolationError("The Harness Secret is unavailable.");
@@ -12746,7 +12763,7 @@ export class OpenClawController {
       return immutableCopy({ ...binding, secretDriverId: driver.id });
     }
     if (binding.method === "credential_source") {
-      await this.authorizeAgentPrincipal(agent.servicePrincipalId, "operate", {
+      await this.authorizeAgentPrincipal(principalId, agent, "operate", {
         kind: "credential_source",
         namespaceId: agent.namespaceId,
         id: binding.sourceId,
@@ -13289,7 +13306,7 @@ export class OpenClawController {
       );
     }
     if (!(await state.installations.holdPrincipalAccount(principalId))) {
-      throw new AuthorizationDeniedError("The acting account is disabled.");
+      throw new CallerStateDeniedError("The acting account is disabled.");
     }
   }
 

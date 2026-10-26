@@ -1103,6 +1103,14 @@ export const scenarios = {
     emptyAgents: true,
     description: "A ready Namespace with no Agents offers creation.",
   },
+  agentsEmptyMember: {
+    group: "Pages/Agents",
+    name: "Empty for a member",
+    emptyAgents: true,
+    readOnlyPermissionSummary: true,
+    description:
+      "A member without Agent create sees no Agents. The heading says none are shared with them, not that the Namespace has none, and nothing invites creating.",
+  },
   agentsUnreadableConfiguration: {
     group: "Pages/Agents",
     name: "Unreadable saved configuration",
@@ -1192,7 +1200,7 @@ export const scenarios = {
     description:
       "The permission summary says this caller can neither stop nor delete these Agents. Each row disables its icons and says why before any confirmation.",
     steps: [
-      "Find No access to stop or delete under each row's icons. The icons do not open a confirmation.",
+      "Find Needs operate and delete under each row's icons. Hover it for the whole reason, which names an Installation administrator as who grants them. The icons do not open a confirmation.",
       "Open an Agent: its detail page explains the same restrictions.",
     ],
     gap: "The summary is advisory. The controller still authorizes each write.",
@@ -1302,7 +1310,8 @@ export const scenarios = {
     group: "Pages/Agents",
     name: "Access denied",
     rules: [{ path: "/namespaces/ns_00000000-0000-4000-8000-000000000001/agents", status: 403 }],
-    description: "Collection authorization denial with a request ID and Retry.",
+    description:
+      "Collection authorization denial with a request ID. Retry would repeat the refusal, so the panel offers none; the header's Refresh checks access again.",
   },
   agentsError: {
     group: "Pages/Agents",
@@ -3530,7 +3539,7 @@ export const scenarios = {
     description:
       "The session already knows this member does not administer the Installation, so after the Agent saves the form sends no IAM read for its credential grant. It names the administrator step at once and offers Open saved Agent, with no Retry credential access.",
     steps: [
-      "Read the alert: giving the Agent access to its Secrets needs Installation administration access.",
+      "Read the alert: giving the Agent access to its Secrets needs Installation administration, so it asks an Installation administrator to open the saved Agent and grant it.",
       "The saved-resources line identifies the Configuration and Agent, offers Open saved Agent, and does not promise a retry.",
       "The request log shows no /iam/ request. Only Cancel and Start over remain beside the saved-resources line.",
     ],
@@ -5681,6 +5690,17 @@ export const scenarios = {
     description:
       "Diagnostics that answer within 250 ms replace the panel's result directly, without painting the waiting line or moving focus.",
   },
+  diagnosticsNoSlack: {
+    group: "Pages/Agent detail",
+    name: "Current observations for a version without Slack",
+    path: candidateVersion,
+    deployed: true,
+    candidateDeploymentStatus: "succeeded",
+    diagnosticsState: "noSlack",
+    actions: [click("Run diagnostics for this version")],
+    description:
+      "The gateway reports a version with no Slack channel as a failed configuration check with code NOT_CONFIGURED. The rows read not set up and not checked, and the note says there is nothing to check.",
+  },
   diagnosticsReader: {
     group: "Pages/Agent detail",
     name: "Current observations for a reader without operate",
@@ -5935,6 +5955,23 @@ export const scenarios = {
     steps: [
       "Wait for both the status access message and the log rows. Open Namespaces, then use browser Back; the Console asks for status once more and shows the Pod.",
     ],
+  },
+  runtimeLogTextDenied: {
+    group: "Pages/Agent detail",
+    name: "Runtime status and log text refused",
+    path: `${candidateVersion}&tab=logs`,
+    deployed: true,
+    candidateDeploymentStatus: "succeeded",
+    rules: [
+      {
+        path: "/namespaces/ns_00000000-0000-4000-8000-000000000001/agents/agt_00000000-0000-4000-8000-000000000001/deployments/rev_00000000-0000-4000-8000-000000000007/runtime",
+        status: 403,
+        code: "FORBIDDEN",
+      },
+      refuseLogRead,
+    ],
+    description:
+      "A reader with neither Agent operate nor Agent read_logs. The status line names the grants runtime status and log text need, in the API's words, and that an Installation administrator gives them.",
   },
   runtimeLogsReaderDownload: {
     group: "Pages/Agent detail",
@@ -6208,12 +6245,12 @@ export const scenarios = {
         status: 403,
         code: "FORBIDDEN",
         message:
-          "The Agent service principal service-agent-agt_00000000-0000-4000-8000-000000000001 is not authorized to operate secret sec_00000000-0000-4000-8000-000000000001. Grant that principal operate on the secret, then deploy again.",
+          "Agent agt_00000000-0000-4000-8000-000000000001 cannot use Secret sec_00000000-0000-4000-8000-000000000001: the Agent itself needs Secret operate on it. Ask an Installation administrator to give the Agent access, then deploy again.",
       },
     ],
     actions: [click("Deploy new version")],
     description:
-      "A denial for the Agent's own service principal names the principal and the grant to add. A caller's own denial keeps the console's guidance.",
+      "A denial for the Agent's own service principal names the grant the Agent lacks and who gives it. The Secret is named only to a caller who may read it. A caller's own denial keeps the console's guidance.",
   },
   revisionDeployDenied: {
     group: "Pages/Agent detail",
@@ -8021,11 +8058,14 @@ export const scenarios = {
         path: "/namespaces/ns_00000000-0000-4000-8000-000000000001/agents/agt_00000000-0000-4000-8000-000000000001",
         method: "DELETE",
         status: 403,
+        code: "FORBIDDEN",
+        message:
+          "Not authorized: this needs Agent delete on Agent agt_00000000-0000-4000-8000-000000000001. Ask an Installation administrator to grant it.",
       },
     ],
     actions: [click("Delete Agent"), click("Permanently delete Agent")],
     description:
-      "Permission advice is unavailable. The attempted deletion is denied and the Console explains the missing access.",
+      "Permission advice is unavailable. The attempted deletion is denied; the Console shows the API's sentence naming the missing grant and who grants it.",
   },
   deletionConflict: {
     group: "Components/Deletion",
