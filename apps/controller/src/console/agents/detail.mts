@@ -98,6 +98,11 @@ import {
   readRevisionPage,
 } from "./deployment-evidence.mjs";
 import { createDeploymentRecovery } from "./deployment-recovery.mjs";
+import {
+  sameNamespaceSecretHref,
+  secretMetadata,
+  secretSourceForBinding,
+} from "./secret-picker.mjs";
 
 type DetailContext = ConsolePageContext & { namespaceId: string; agentId: string };
 type Permissions = Static<typeof AgentCallerPermissionsResponse>["data"];
@@ -258,6 +263,13 @@ function deployFailureText(cause: unknown, submitted: boolean) {
   return error.status === 403
     ? `Deployment denied. Check Agent deploy permission and access to selected Secrets. First deployment also needs Agent read and operate permissions to create connection credentials. Granting them ${askInstallationAdministrator("check these grants")}`
     : "Deployment conflicts with the saved Agent state. Refresh this Agent to check for changed Configuration or missing connection credentials. If credentials are missing after an earlier version, ask an operator to restore them.";
+}
+
+// Deployment authorizes Secret operate on every Secret the draft binds (finding 2546).
+function deploySecretsOperateReason(names: readonly string[]) {
+  const listed =
+    names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
+  return `Deploying needs Secret operate on ${listed}, which your access does not include. Ask an Installation administrator to grant it.`;
 }
 
 // The credential an Agent's harness authentication grant covers: its credential source or its
@@ -719,6 +731,52 @@ export async function renderAgentDetail(
   }
   const tabsForSelection = new Set(tabLabels.map(([id]) => id));
   let selectedTab = tab && tabsForSelection.has(tab) ? tab : "configuration";
+  // A link to a tab this version or this reader does not have shows Configuration and says why,
+  // naming the tab (finding 2552).
+  // An empty `tab=` is no tab: it shows Configuration without a note.
+  function unavailableTabNotice(requested: string | null) {
+    if (!requested || tabsForSelection.has(requested)) {
+      return "";
+    }
+    const reason =
+      requested === "access"
+        ? "The Access tab needs Installation administration, which your access does not include."
+        : requested === "repositories" || requested === "credentials"
+          ? `The ${requested === "credentials" ? "Credentials" : "Repositories"} tab is on the version draft only.`
+          : requested === "logs"
+            ? "The Logs tab is on deployed versions only."
+            : `This Agent has no “${requested.slice(0, 40)}” tab.`;
+    return `${reason} Showing Configuration.`;
+  }
+  const tabNotice = statusBlock("info", null, null, [], {
+    className: "agent-tab-notice",
+    role: "status",
+  });
+  function showTabNotice(text: string) {
+    if (text === "") {
+      cancelAnnouncement(tabNotice);
+      tabNotice.textContent = "";
+    } else {
+      setAnnouncedText(tabNotice, text);
+    }
+    tabNotice.hidden = text === "";
+  }
+  showTabNotice(unavailableTabNotice(tab));
+  // Set when a read the page had the grant for is refused: the caller's access changed, so tab
+  // changes read the page again instead of showing tabs built from earlier reads (findings 2550,
+  // 2568).
+  let accessChanged = false;
+  // Reads that succeeded on this page. A later refusal of one is a revocation (finding 2568).
+  const allowedReads = new Set<string>([path]);
+  // Whether refusing this read means the caller's access changed: the same read succeeded on this
+  // page, or it needs only Agent read, which the page's own Agent read used. A read whose grant
+  // the page never had (a Namespace's Secrets for an Agent reader, say) changes nothing. Runtime
+  // status and log reads are left to Logs, which weighs a refusal against the permission answer.
+  const readHadGrant = (readPath: string) =>
+    !readPath.startsWith(`${path}/deployments/`) &&
+    (allowedReads.has(readPath) ||
+      readPath.startsWith(`${path}/workspace/files/`) ||
+      readPath === `${path}/driver-configurations`);
   let deployInFlight = false;
   // The draft holds below are declared before a deleting Agent's early return: ← Agents and the
   // reload check read them on that page too (finding 2125).
@@ -1377,7 +1435,7 @@ export async function renderAgentDetail(
   };
   tabs.addEventListener("scroll", fadeTabEdges, { passive: true });
   versionSummary.append(detailHeading, versionEvidence);
-  detailPane.append(tabs, content);
+  detailPane.append(tabs, tabNotice, content);
   const nativeAdmin = renderNativeAdminAccess(context, path, () =>
     latestPermissionsRead.then((permissions) => permissions?.administer),
   );
@@ -1407,6 +1465,27 @@ export async function renderAgentDetail(
   const revealed = new Promise<void>((resolve) => {
     markRevealed = resolve;
   });
+  // Set while the page replaces its own address after an unavailable tab link: that navigation
+  // keeps the shown Configuration and its note instead of rebuilding the page.
+  let normalizingTabLink = false;
+  if (!tabNotice.hidden) {
+    void revealed.then(() => {
+      if (!context.isCurrent() || deleting || tabNotice.hidden || selectedTab !== "configuration") {
+        return;
+      }
+      // The note was written before the page was on screen: write it again so screen readers
+      // announce it.
+      announceAfterShown(tabNotice, tabNotice.textContent ?? "");
+      // The address drops the unavailable tab, so a reload or a shared link does not repeat the
+      // note (finding 2567).
+      normalizingTabLink = true;
+      try {
+        context.navigate(target(selected, "configuration"), namespaceId, true);
+      } finally {
+        normalizingTabLink = false;
+      }
+    });
+  }
   // A Logs entry that scrolls to its output also waits for that output (within the same bound)
   // and scrolls in the frame that reveals the page, never at the top first (finding 1552).
   let revealHold: Promise<void> | null = null;
@@ -2530,6 +2609,7 @@ export async function renderAgentDetail(
     }
     try {
       const value = await request(snapshotPath);
+      allowedReads.add(snapshotPath);
       return selected === "draft"
         ? configurationForPage(value, agent.configurationId)
         : revisionForPage(value, selected);
@@ -2611,8 +2691,12 @@ export async function renderAgentDetail(
     let authenticationForm: HTMLElement | undefined;
     const retainedAuthentication = context.drafts.get("authentication") as
       AuthenticationDraft | undefined;
+    // A member's save that this session could not verify is finished: it holds nothing
+    // (finding 2547).
     let authenticationPending = Boolean(
-      retainedAuthentication?.outcomeUnknown || retainedAuthentication?.savedAuthentication,
+      retainedAuthentication?.outcomeUnknown ||
+      (retainedAuthentication?.savedAuthentication &&
+        retainedAuthentication.grantProblem !== "unverified"),
     );
     // Authentication edits staged in Credentials but not yet saved.
     let authenticationUnsaved = false;
@@ -2676,8 +2760,9 @@ export async function renderAgentDetail(
             updateDeployControls();
             // The answer's denied binding names describe the bindings before this save. Read it
             // again, so the panel and the Channels drawer stop asking to replace a binding the
-            // save rebound (findings 2444, 2457).
+            // save rebound (findings 2444, 2457), and Deploy names the Secrets now bound.
             void rereadPermissions();
+            void readDeploySecretsDenied();
           },
           onReload: (carried = null) => {
             carriedChannelSecrets = carried;
@@ -2728,6 +2813,56 @@ export async function renderAgentDetail(
         () => false,
       );
     }
+    // Deployment needs Secret operate on each Secret the draft binds: its Configuration's Secret
+    // bindings and a Secret authentication source. The Secret operate answer names the bound ones
+    // this caller may not operate, so Deploy says so before a click the API would refuse. An
+    // unknown or unreported answer names none and leaves Deploy to the API (finding 2546).
+    let deploySecretsDenied: readonly string[] = [];
+    let deploySecretsRead = 0;
+    async function boundSecretsDenied({ fresh = false } = {}) {
+      const bound = new Map<string, unknown>();
+      for (const binding of Object.values(snapshot.secretBindings ?? {})) {
+        const source = secretSourceForBinding(binding);
+        if (source) {
+          bound.set(source.id, source);
+        }
+      }
+      const harness = harnessCredential(agent.harnessAuth, namespaceId);
+      if (harness?.kind === "secret") {
+        bound.set(harness.id, harness);
+      }
+      if (bound.size === 0) {
+        return [];
+      }
+      const denied = await secretsOperateDenied({ fresh });
+      // The answer lists only Secrets this caller may read, so each one's name reads too.
+      const names = await Promise.all(
+        [...bound]
+          .filter(([id]) => denied?.has(id))
+          .map(async ([id, source]) => {
+            const href = sameNamespaceSecretHref(source, namespaceId);
+            try {
+              return href ? (secretMetadata(await request(href), namespaceId)?.name ?? id) : id;
+            } catch {
+              return id;
+            }
+          }),
+      );
+      return names.sort((left, right) => left.localeCompare(right));
+    }
+    function readDeploySecretsDenied(options?: { fresh?: boolean }) {
+      const read = ++deploySecretsRead;
+      return boundSecretsDenied(options).then(
+        (names) => {
+          if (read === deploySecretsRead && context.isCurrent()) {
+            deploySecretsDenied = names;
+            updateDeployControls();
+          }
+          return names;
+        },
+        () => deploySecretsDenied,
+      );
+    }
     function editedSubject() {
       if (selectedTab === "repositories") {
         return "repository access";
@@ -2752,6 +2887,7 @@ export async function renderAgentDetail(
       return (
         deployPending ||
         callerPermissions?.deploy === false ||
+        deploySecretsDenied.length > 0 ||
         authenticationSaveState !== "idle" ||
         Boolean(deployReloadMessage) ||
         authenticationPending ||
@@ -2793,6 +2929,10 @@ export async function renderAgentDetail(
       if (!deployPending) {
         if (callerPermissions?.deploy === false) {
           deployStatus.textContent = "Your access does not include deploying this Agent.";
+        } else if (deploySecretsDenied.length) {
+          const reason = deploySecretsOperateReason(deploySecretsDenied);
+          // A refused deployment's alert already says it.
+          deployStatus.textContent = deployFeedback.textContent === reason ? "" : reason;
         } else if (deployReloadMessage) {
           deployStatus.textContent = deployReloadMessage;
         } else if (authenticationSaveState === "saving") {
@@ -3055,7 +3195,22 @@ export async function renderAgentDetail(
             context.onExpired();
             return;
           }
-          deployFeedback.textContent = deployFailureText(error, submitted);
+          const failure = requestFailure(error);
+          // A plain denial does not say which grant failed. When the Secret operate answer, read
+          // again, names bound Secrets this caller may not operate, the alert names them and
+          // Deploy stays disabled until a grant is read (finding 2546).
+          const deniedSecrets =
+            submitted &&
+            failure.status === 403 &&
+            (failure.serverMessage === undefined || failure.serverMessage === GENERIC_DENIAL)
+              ? await readDeploySecretsDenied({ fresh: true })
+              : [];
+          if (!context.isCurrent()) {
+            return;
+          }
+          deployFeedback.textContent = deniedSecrets.length
+            ? deploySecretsOperateReason(deniedSecrets)
+            : deployFailureText(error, submitted);
           if (
             !submitted ||
             deployRefusedBeforeAdmission(error) ||
@@ -3092,6 +3247,7 @@ export async function renderAgentDetail(
       { tone: "primary", className: "primary" },
     );
     updateDeployControls();
+    void readDeploySecretsDenied();
     const draftActions = element(
       "section",
       { className: "card agent-draft-actions" },
@@ -3483,12 +3639,22 @@ export async function renderAgentDetail(
     const tabContext: DetailContext = {
       ...context,
       isCurrent: () => context.isCurrent() && mountedTab === state,
-      request: async (path, options) => {
+      request: async (readPath, options) => {
+        const read = (options?.method ?? "GET") === "GET";
         state.pending += 1;
         try {
-          return await context.request(path, options);
+          const result = await context.request(readPath, options);
+          if (read) {
+            allowedReads.add(readPath);
+          }
+          return result;
         } catch (error) {
           state.reusable = false;
+          // Any tab's refusal of a read the page had the grant for, not only Logs', makes the next
+          // tab change read the page again instead of reusing tabs read before (finding 2568).
+          if (read && requestFailure(error).status === 403 && readHadGrant(readPath)) {
+            accessChanged = true;
+          }
           throw error;
         } finally {
           state.pending -= 1;
@@ -3604,6 +3770,9 @@ export async function renderAgentDetail(
           if (tabContext.isCurrent() && !recovery.section.hidden) {
             renderLatestDeployment();
           }
+        },
+        onAccessChanged: () => {
+          accessChanged = true;
         },
       });
       content.append(logs.section);
@@ -4321,6 +4490,9 @@ export async function renderAgentDetail(
             grantProblem = "unverified";
             if (context.isCurrent()) {
               say(grantText(grantProblem), "warning");
+              // The binding saved and nothing in this session can confirm the grant, so Deploy
+              // is not held: the API checks the Agent's access when it deploys (finding 2547).
+              data.setAuthenticationPending(false);
             }
             return;
           }
@@ -5207,6 +5379,9 @@ export async function renderAgentDetail(
       return false;
     }
     if (nextRevision === selected && nextTab === selectedTab) {
+      if (normalizingTabLink) {
+        return true;
+      }
       // The page's own reloads (a retry, a draft re-read) rebuild it: a share waits for them too.
       if (!sharingWrite) {
         return false;
@@ -5222,11 +5397,12 @@ export async function renderAgentDetail(
       }
       return "blocked";
     }
-    if (nextRevision !== selected) {
+    if (nextRevision !== selected || accessChanged) {
       return false;
     }
     const linked = takeLinkedVersionView(linkedKey(nextRevision, nextTab));
     selectedTab = nextTab;
+    showTabNotice(unavailableTabNotice(requestedTab));
     // A Logs visit may have just been denied: the recovery stops offering its Logs link.
     if (!recovery.section.hidden) {
       renderLatestDeployment();

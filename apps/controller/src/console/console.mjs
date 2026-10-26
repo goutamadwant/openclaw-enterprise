@@ -7,7 +7,7 @@ import {
   renderCreateAgent,
   renderAgentDetail,
 } from "./agents.mjs";
-import { clearRuntimeDenials } from "./agents/logs.mjs";
+import { clearRuntimeDenials, forgetRuntimeDenials } from "./agents/logs.mjs";
 import { renderNativeAdminAccess } from "./agents/native-admin.mjs";
 import { createApiClient } from "./api-client.mjs";
 import { createViewLifetime } from "./view-lifetime.mjs";
@@ -22,6 +22,15 @@ const app = document.querySelector("#app");
 const lifetime = createViewLifetime();
 let session = null;
 let namespaces = [];
+// Namespaces a list read in this sign-in returned: only those can be ones the reader "no
+// longer" has access to (finding 2550).
+const listedNamespaceIds = new Set();
+function setNamespaces(readable) {
+  namespaces = sorted(readable);
+  for (const item of namespaces) {
+    listedNamespaceIds.add(item.id);
+  }
+}
 let namespaceId = null;
 let observabilityUrl = null;
 // Set while the last Backends read was denied, so Retry and Refresh do not show the Namespace
@@ -219,6 +228,54 @@ function providerUnavailableFailure(label) {
 // The callback failed inside OCE (its database or audit store), so no sign-in can finish.
 function signInUnavailableFailure(label) {
   return `Could not finish signing in with ${label}. Sign-in is unavailable right now; try again later.`;
+}
+
+// The API refused a sign-in request because the browser did not send the console's
+// configured Origin: the page was opened at another address, or a proxy changed the
+// request. It says nothing about the account, so it never reads as a wrong password.
+function untrustedOrigin(error) {
+  return (
+    error?.status === 403 &&
+    error.code === "FORBIDDEN" &&
+    typeof error.serverMessage === "string" &&
+    error.serverMessage.startsWith("A trusted browser origin is required")
+  );
+}
+const untrustedOriginFailure =
+  "Sign-in was refused because this page was not opened from the console's configured address. Open the console from its configured URL and sign in there. If you did, ask an operator to check the console address setting (OCC_AUTH_BASE_URL) and any proxy in front of it.";
+
+// A sign-in limit is not a refusal: an Installation administrator's correct password still
+// signs in while the limit applies, so the form stays usable and only says how long to wait.
+function rateLimitedFailure(error) {
+  const seconds = error.retryAfterSeconds;
+  return seconds === undefined
+    ? "Too many sign-in attempts. Wait a minute, then try again."
+    : `Too many sign-in attempts. Wait ${seconds} ${seconds === 1 ? "second" : "seconds"}, then try again.`;
+}
+
+const signInOutage =
+  "Sign-in is temporarily unavailable because a service it depends on did not answer. Try again shortly. If it continues, ask an operator.";
+
+// The confirmation after the provider's callback failed. The callback already settled the
+// identity (a refused one returns with authError and never reaches this exchange), so a
+// failure here says why this tab could not adopt the session, never that the identity failed.
+function providerExchangeFailure(error, label) {
+  if (error?.status === 429) {
+    return rateLimitedFailure(error);
+  }
+  if (untrustedOrigin(error)) {
+    return untrustedOriginFailure;
+  }
+  if (error?.status === undefined || error.status >= 500) {
+    return signInUnavailableFailure(label);
+  }
+  // Other than the origin check, the exchange answers 403 only when this API no longer
+  // configures the provider (it was removed after the start), which the provider list shows
+  // anyway. Starting again would fail the same way (finding 2555).
+  if (error.status === 403) {
+    return `Could not finish signing in with ${label}. ${label} sign-in is no longer available on this Installation. Use another sign-in method, or ask an administrator.`;
+  }
+  return `Could not finish signing in with ${label}. The sign-in in this tab did not complete in time, or another sign-in replaced it. Select Continue with ${label} to start again.`;
 }
 
 // The provider authenticated an identity attached to a disabled account. Retrying, a
@@ -495,12 +552,15 @@ const { publicPanel, renderRows, switchNamespace } = shellUI;
 // selector, which is disabled when no Namespace is readable (a member whose only grant was
 // revoked, on a bookmarked link), so the panel then points at the header's Refresh, as the
 // no-readable-Namespace panel does (findings 2371, 2393).
-function namespaceUnavailablePanel(view) {
+function namespaceUnavailablePanel(view, unavailableId) {
+  const why = listedNamespaceIds.has(unavailableId)
+    ? "This Namespace is missing or you no longer have access"
+    : "This Namespace is missing or not shared with you";
   if (namespaces.length) {
     panel(
       view,
       "Namespace unavailable",
-      "This Namespace is missing or you no longer have access. Choose another Namespace.",
+      `${why}. Choose another Namespace.`,
       "Switch Namespace",
       () => switchNamespace(),
     );
@@ -509,7 +569,7 @@ function namespaceUnavailablePanel(view) {
   panel(
     view,
     "Namespace unavailable",
-    "This Namespace is missing or you no longer have access, and you cannot read any other Namespace. Ask an administrator to grant you access to one, then Refresh.",
+    `${why}, and you cannot read any other Namespace. Ask an administrator to grant you access to one, then Refresh.`,
   );
 }
 const request = createApiClient({
@@ -877,6 +937,7 @@ function clearPrivate() {
   nativeRecovery = null;
   backendsDenied = false;
   namespaces = [];
+  listedNamespaceIds.clear();
   namespaceId = null;
   observabilityUrl = null;
   observabilityOwner = null;
@@ -997,10 +1058,12 @@ function showLogin(message = "", destination = null) {
         }
         feedback.textContent =
           error.status === 429
-            ? "Too many attempts. Try again later."
-            : recoveryOnly
-              ? `${label} sign-in is unavailable. Try again later.`
-              : `${label} sign-in is unavailable. Try again or use your password.`;
+            ? rateLimitedFailure(error)
+            : untrustedOrigin(error)
+              ? untrustedOriginFailure
+              : recoveryOnly
+                ? `${label} sign-in is unavailable. Try again later.`
+                : `${label} sign-in is unavailable. Try again or use your password.`;
         pending = false;
         setDisabled(false);
       }
@@ -1064,14 +1127,22 @@ function showLogin(message = "", destination = null) {
       if (!lifetime.isCurrent(active)) {
         return;
       }
+      // Every credential refusal keeps one text, so it never says whether the account exists,
+      // is disabled, or which factor failed.
       feedback.textContent =
         error.status === 429
-          ? "Too many attempts. Try again later."
-          : error.status === 400 || error.status === 401 || error.status === 403
-            ? recoveryOnly
-              ? "Could not sign in. Only the recovery account can use a password; other accounts continue with their external sign-in."
-              : "Could not sign in. Check your email and password."
-            : "Sign-in is unavailable. Try again.";
+          ? rateLimitedFailure(error)
+          : untrustedOrigin(error)
+            ? untrustedOriginFailure
+            : error.status === 400 || error.status === 401 || error.status === 403
+              ? recoveryOnly
+                ? "Could not sign in. Only the recovery account can use a password; other accounts continue with their external sign-in."
+                : "Could not sign in. Check your email and password."
+              : error.status === undefined
+                ? "Could not reach the sign-in service. Check your connection, then try again."
+                : error.status >= 500
+                  ? signInOutage
+                  : "Sign-in is unavailable. Try again.";
     } finally {
       if (lifetime.isCurrent(active)) {
         pending = false;
@@ -1221,6 +1292,11 @@ async function loadPage({
     reuseView = false;
   }
   namespaceId = current.namespace;
+  if (fromRefresh && current.agentId && current.namespace) {
+    // Refresh checks access again: an Agent's Logs view asks again instead of reusing a denial
+    // remembered earlier in this sign-in (finding 2566).
+    forgetRuntimeDenials(current.namespace, current.agentId);
+  }
   const active = resetReads({
     retainView: knownPrivateState,
     // A Namespaces row link marks itself too, so Back returns focus to that row.
@@ -1427,9 +1503,11 @@ async function loadPage({
       }
       pinSessionKey(confirmed.sessionKey);
       pendingIntent = externalIntent;
-    } catch {
+    } catch (error) {
       if (lifetime.isCurrent(active)) {
-        showLogin(providerFailure(externalProviders[externalAttempt.provider].label));
+        showLogin(
+          providerExchangeFailure(error, externalProviders[externalAttempt.provider].label),
+        );
       }
       return;
     }
@@ -1567,7 +1645,7 @@ async function loadPage({
       throw new Error("Invalid collection response");
     }
     clearRetainedViewsOutsideNamespaces(readable);
-    namespaces = sorted(readable);
+    setNamespaces(readable);
     accessResolved = true;
     if (observability) {
       observabilityUrl = observability.url;
@@ -1918,7 +1996,7 @@ async function loadPage({
           "Ask an administrator to create a Namespace or grant you access to one, then Refresh.",
         );
       } else {
-        namespaceUnavailablePanel(shell.view);
+        namespaceUnavailablePanel(shell.view, namespaceId);
       }
       return;
     }
@@ -2471,11 +2549,14 @@ async function revalidateMountedAgent(current) {
     }
     clearRetainedViewsOutsideNamespaces(readable);
     session = resolvedSession;
-    namespaces = sorted(readable);
+    setNamespaces(readable);
     if (!namespaces.some((item) => item.id === selectedNamespace)) {
       clearRetainedViewsForNamespace(selectedNamespace);
       resetReads();
-      namespaceUnavailablePanel(renderShell(current.feature, false, { page: null }).view);
+      namespaceUnavailablePanel(
+        renderShell(current.feature, false, { page: null }).view,
+        selectedNamespace,
+      );
       return;
     }
     checking = "detail";

@@ -8,8 +8,11 @@ import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs
 import { createTestSecretDriver } from "../helpers/secret-driver.mjs";
 import {
   accessBindingPostRequests,
+  AGENT_READ,
   apiRequests,
   detailUrl,
+  expectNoText,
+  grantSecretOperate,
   hasFocus,
   holdRequests,
   login,
@@ -797,6 +800,63 @@ test("overlapping policy refreshes retain the newest read and continue pending p
   assert.equal((await fixture.request("GET", base)).data.policy.application.state, "pending");
 });
 
+// A failed live application says why and what to do next instead of showing only its reason
+// code; only an unconfirmed one keeps the "may have accepted part" notice (finding 2537). The
+// fixture has no worker, so the reads after a real apply answer with the failure the worker
+// records for that application (worker/sandbox-policy.ts).
+for (const c of [
+  {
+    reason: "SANDBOX_POLICY_CEILING_CHANGED",
+    // The worker repeats this check after it sent the policy, so the text never claims that
+    // nothing was applied (finding 2570).
+    text: "The Installation delegation ceiling changed and no longer covers every saved rule. The controller does not send this policy again, and it did not confirm whether the Sandbox runs it. Remove the rules outside the ceiling, save, then apply again.",
+  },
+  {
+    reason: "SANDBOX_POLICY_UNCONFIRMED",
+    text: "Application was not confirmed. The provider may have accepted part of the request; refresh and retry explicitly. No redeployment was started.",
+  },
+]) {
+  test(`a failed policy application (${c.reason}) says why and what to do next`, async (t) => {
+    const { fixture, namespace, agent, base } = await createPolicyConsole(t, [
+      delegatedPolicyGrant,
+    ]);
+    const { revision } = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
+    assert.equal(
+      (
+        await fixture.request("PUT", base, {
+          body: { expectedVersion: 1, additions: [delegatedPolicyGrant] },
+        })
+      ).status,
+      200,
+    );
+    const { page } = await newPage(t, fixture);
+    await login(page, fixture, detailUrl(fixture, namespace.id, agent.id, revision.id, "policy"));
+    await page.getByText("Matches saved policy v2.", { exact: false }).waitFor();
+    await page
+      .getByRole("button", { name: "Apply saved policy to current revision", exact: true })
+      .click();
+    await page.getByText(/Application to the current revision is pending/).waitFor();
+    await page.route(`${fixture.origin}${base}`, async (route) => {
+      if (route.request().method() !== "GET") {
+        await route.fallback();
+        return;
+      }
+      const response = await route.fetch();
+      const body = await response.json();
+      const { application } = body.data.policy;
+      assert.equal(application.state, "pending");
+      body.data.policy.application = { ...application, state: "failed", reason: c.reason };
+      await route.fulfill({ response, json: body });
+    });
+    // The pending application's poll reads the failure.
+    const notice = page.locator(".notice", { hasText: c.text });
+    await notice.waitFor();
+    assert.equal(await notice.textContent(), c.text);
+    // The code stays on the status line beside the failed state.
+    await page.getByText(`Application: failed · ${c.reason} ·`, { exact: false }).waitFor();
+  });
+}
+
 test("Agent deployment requires a reload after repository access changes", async (t) => {
   const { fixture, namespace } = await createRepositoryLaunchFixture(t, (namespaceId) => [
     {
@@ -1362,6 +1422,99 @@ for (const tab of ["configuration", "repositories"]) {
     await page.waitForURL(/revision=rev_/);
   });
 }
+
+// Deploying authorizes Secret operate on every Secret the draft binds. An operator who may deploy
+// the Agent but not operate its model Secret (the iam.md operator without Secret operate) is told
+// so beside a disabled Deploy, naming the Secret and who grants it, instead of clicking into a
+// refusal. When the answer is unknown, Deploy stays enabled and the API's plain 403 is explained
+// with the same named sentence. With the grant, the same operator deploys (finding 2546).
+test("Deploy names the bound Secrets an operator may not operate", async (t) => {
+  const { fixture, namespace, agent, path } = await deployableRepositoryAgent(
+    t,
+    "Operator Secret Agent",
+  );
+  const modelSecret = agent.harnessAuth.source;
+  const operator = await fixture.createNamespaceMember("operator", namespace.id, [
+    ...AGENT_READ,
+    ["read_logs", "agent"],
+    ["deploy", "agent"],
+    ["operate", "agent"],
+    ["read", "secret"],
+  ]);
+  const reason =
+    "Deploying needs Secret operate on Demo model credential, which your access does not include. Ask an Installation administrator to grant it.";
+  const url = detailUrl(fixture, namespace.id, agent.id, "draft", "configuration");
+  const deployPosts = (requests) =>
+    requests.filter(
+      ({ method, path: requested }) => method === "POST" && requested === `${path}/deploy`,
+    );
+
+  // Known answer: Deploy is disabled up front and nothing is sent.
+  {
+    const { page } = await newPage(t, fixture);
+    const requests = apiRequests(page, fixture.origin);
+    await login(page, fixture, url, operator.credentials);
+    await page.getByRole("heading", { name: "Operator Secret Agent" }).waitFor();
+    await page.getByText(reason, { exact: true }).waitFor();
+    const deploy = page.getByRole("button", { name: "Deploy new version" });
+    assert.equal(await deploy.isDisabled(), true);
+    assert.deepEqual(deployPosts(requests), []);
+  }
+
+  // Unknown answer: the first Secret answer fails, so Deploy stays enabled and the API decides.
+  // Its plain 403 says nothing about which grant failed; the answer, read again, names it.
+  {
+    const { page } = await newPage(t, fixture);
+    let failed = false;
+    await page.route(`${fixture.origin}${path}/permissions/secrets`, async (route) => {
+      if (failed) {
+        await route.continue();
+        return;
+      }
+      failed = true;
+      await route.abort();
+    });
+    await login(page, fixture, url, operator.credentials);
+    await page.getByRole("heading", { name: "Operator Secret Agent" }).waitFor();
+    const deploy = page.getByRole("button", { name: "Deploy new version" });
+    await waitForEnabled(deploy);
+    const refused = page.waitForResponse(
+      (response) =>
+        response.url() === `${fixture.origin}${path}/deploy` &&
+        response.request().method() === "POST",
+    );
+    await deploy.click();
+    const response = await refused;
+    assert.equal(response.status(), 403);
+    assert.equal((await response.json()).error.message, GENERIC_DENIAL);
+    const alert = page.getByRole("alert").filter({ hasText: reason });
+    await alert.waitFor();
+    assert.equal(await alert.textContent(), reason);
+    // The alert says it once, and Deploy stays disabled until a grant is read.
+    assert.equal(await page.getByText(reason).count(), 1);
+    assert.equal(await deploy.isDisabled(), true);
+  }
+
+  // With Secret operate on the model Secret, the gate never holds less than the API allows: the
+  // same operator deploys.
+  grantSecretOperate(fixture, namespace.id, operator.principal, [modelSecret.id]);
+  {
+    const { page } = await newPage(t, fixture);
+    await login(page, fixture, url, operator.credentials);
+    await page.getByRole("heading", { name: "Operator Secret Agent" }).waitFor();
+    const deploy = page.getByRole("button", { name: "Deploy new version" });
+    await waitForEnabled(deploy);
+    await expectNoText(page, reason);
+    const admitted = page.waitForResponse(
+      (response) =>
+        response.url() === `${fixture.origin}${path}/deploy` &&
+        response.request().method() === "POST",
+    );
+    await deploy.click();
+    assert.equal((await admitted).status(), 202);
+    await page.waitForURL(/revision=rev_/);
+  }
+});
 
 test("Agent deployment shows the API's typed 403 and 409 refusals", async (t) => {
   const { fixture, namespace, modelSecret, grantModelAccess } =
