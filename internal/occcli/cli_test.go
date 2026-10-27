@@ -411,7 +411,7 @@ func TestAgentLogsRejectsInvalidFlagsBeforeAnyRequest(t *testing.T) {
 		stub := &runtimeLogStub{t: t}
 		_, _, err := runLogsCommand(t, context.Background(), stub, args...)
 		// The hint keeps the selected Namespace so the copied command targets the same Agent.
-		if err == nil || err.Error() != `agent agt_00000000-0000-4000-8000-000000000001 has no active revision and no revision you can read; listing revisions needs AgentRevision read (ask an Installation administrator to grant it), or pass --revision with a revision ID; if it was never deployed, run "occ --namespace ns_00000000-0000-4000-8000-000000000001 agent deploy agt_00000000-0000-4000-8000-000000000001" first` {
+		if want := noReadableRevision("agt_00000000-0000-4000-8000-000000000001") + `, or pass --revision with a revision ID; if it was never deployed, run "occ --namespace ns_00000000-0000-4000-8000-000000000001 agent deploy agt_00000000-0000-4000-8000-000000000001" first`; err == nil || err.Error() != want {
 			t.Fatalf("follow=%v: expected a missing revision error, got %v", follow, err)
 		}
 		if len(stub.queries) != 0 {
@@ -435,7 +435,7 @@ func TestAgentLogsNameTheRevisionGrantWhenNoRevisionIsReadable(t *testing.T) {
 	if !strings.Contains(out, "active output") || !slices.Contains(stub.paths, "/namespaces/ns_00000000-0000-4000-8000-000000000001/agents/agt_00000000-0000-4000-8000-000000000001/deployments/rev_00000000-0000-4000-8000-000000000001/runtime/logs") {
 		t.Fatalf("logs output = %q, requests = %v", out, stub.paths)
 	}
-	if want := "notice: reading the active revision rev_00000000-0000-4000-8000-000000000001; you can read none of agent agt_00000000-0000-4000-8000-000000000001's revisions, so a newer or failed revision was not checked (listing revisions needs revision read)\n"; errOut != want {
+	if want := "notice: reading the active revision rev_00000000-0000-4000-8000-000000000001; you can read none of agent agt_00000000-0000-4000-8000-000000000001's revisions, so a newer or failed revision was not checked (listing revisions needs AgentRevision read)\n"; errOut != want {
 		t.Fatalf("logs notice = %q, want %q", errOut, want)
 	}
 
@@ -447,7 +447,7 @@ func TestAgentLogsNameTheRevisionGrantWhenNoRevisionIsReadable(t *testing.T) {
 	}
 
 	reader := `{"update":false,"deploy":false,"operate":false,"delete":false}`
-	logsError := "agent agt_00000000-0000-4000-8000-000000000001 has no active revision and no revision you can read; listing revisions needs AgentRevision read (ask an Installation administrator to grant it), or pass --revision with a revision ID"
+	logsError := noReadableRevision("agt_00000000-0000-4000-8000-000000000001") + ", or pass --revision with a revision ID"
 	for _, test := range []struct {
 		args        []string
 		permissions string
@@ -457,7 +457,7 @@ func TestAgentLogsNameTheRevisionGrantWhenNoRevisionIsReadable(t *testing.T) {
 		// Runtime status itself needs revision read, so --revision is no way around it.
 		{
 			[]string{"agent", "runtime", "agt_00000000-0000-4000-8000-000000000001"}, reader,
-			"agent agt_00000000-0000-4000-8000-000000000001 has no active revision and no revision you can read; listing revisions needs AgentRevision read (ask an Installation administrator to grant it)",
+			noReadableRevision("agt_00000000-0000-4000-8000-000000000001"),
 		},
 		// An unreadable permission summary cannot show deploy access: no deploy advice.
 		{[]string{"agent", "logs", "agt_00000000-0000-4000-8000-000000000001", "--source", "gateway"}, "forbidden", logsError},
@@ -1236,13 +1236,18 @@ func TestRedirectIsReportedWithItsTargetAndNotFollowed(t *testing.T) {
 // query, fragment, or userinfo with the service key.
 func TestOCCURLMustBeABareOrigin(t *testing.T) {
 	const origin = "OCC URL must be an origin without credentials, a path, a query, or a fragment"
+	// The refusal names what to drop and the origin to use (finding D765), but
+	// never echoes credentials, a query or a fragment, which may hold secrets.
+	use := func(has string) string {
+		return origin + "; it has " + has + ". Set OCC_URL (or --url) to https://occ.example.test if that origin serves the OCC API"
+	}
 	for _, testCase := range []struct{ url, want string }{
 		{"ftp://occ.example.test", "OCC URL must use http or https"},
-		{"https://occ.example.test/api", origin},
-		{"https://occ.example.test?", origin},
-		{"https://occ.example.test?region=1", origin},
-		{"https://occ.example.test#top", origin},
-		{"https://user@occ.example.test", origin},
+		{"https://occ.example.test/api", use(`the path "/api"`)},
+		{"https://occ.example.test?", use("a query")},
+		{"https://occ.example.test?token=1", use("a query")},
+		{"https://occ.example.test#top", use("a fragment")},
+		{"https://user:pass@occ.example.test/occ?x=1", use(`credentials and the path "/occ" and a query`)},
 		{"https:///", origin},
 	} {
 		if _, _, err := runHelp(t, "installation", "get", "--url", testCase.url, "--service-key-file", "unused"); err == nil || err.Error() != testCase.want {
@@ -1286,7 +1291,8 @@ func TestUnknownTopLevelCommandFailsInsteadOfPrintingHelp(t *testing.T) {
 		command := New(&out, &errOut)
 		command.SetArgs(args)
 		err := command.Execute()
-		if want := fmt.Sprintf("unknown command %q for \"occ\"", args[0]); err == nil || err.Error() != want {
+		// A close command name may follow as a suggestion (TestMissingCommandsPointAtWhatOCCOffers).
+		if want := fmt.Sprintf("unknown command %q for \"occ\"", args[0]); err == nil || !strings.HasPrefix(err.Error(), want) {
 			t.Fatalf("occ %v error = %v, want %q", args, err, want)
 		}
 		if out.Len() != 0 {
@@ -1395,7 +1401,7 @@ func TestAgentPolicyFlagsAreCheckedBeforeAnyRequest(t *testing.T) {
 	connection := []string{"--url", server.URL, "--service-key-file", keyFile, "--namespace", "ns_00000000-0000-4000-8000-000000000001"}
 	const notNetworking = "--facet must be networking"
 	const emptyFacet = "--facet must name a sandbox policy facet such as networking"
-	const notRevision = `"deploy-1" is not a valid deployment ID: OCC accepts IDs that start with "rev_", not names; run "occ --namespace ns_00000000-0000-4000-8000-000000000001 agent revisions AGENT_ID" to find the ID`
+	notRevision := nameNotIDRefusal("deploy-1", "deployment", "rev_", "occ --namespace ns_00000000-0000-4000-8000-000000000001 agent revisions AGENT_ID")
 	for _, test := range []struct {
 		args []string
 		want string

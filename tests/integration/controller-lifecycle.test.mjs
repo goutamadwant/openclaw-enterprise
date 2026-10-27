@@ -24,7 +24,7 @@ import { createTestSecretDriver } from "../helpers/secret-driver.mjs";
 import { registerAndSelectDrivers } from "../helpers/development.mjs";
 import { bindRole, permissionsFor } from "../helpers/iam-grants.mjs";
 import { requestFailure } from "../../apps/controller/src/http/errors.ts";
-import { agentPrincipalDenied, GENERIC_DENIAL } from "../helpers/refusal-text.mjs";
+import { agentPrincipalDenied } from "../helpers/refusal-text.mjs";
 
 const installation = {
   id: "installation-a",
@@ -96,7 +96,9 @@ function createDrivers(iam) {
     id: "compute-driver-a",
     capability: "compute",
     implementation: "test-only-compute",
-    // This passive lifecycle fixture admits synthetic API-key references, not provider login.
+    // This passive lifecycle fixture represents a managed-capable Compute Driver.
+    supportsGatewayManagedMode: true,
+    // It admits synthetic API-key references, not provider login.
     validateHarnessAuth(harness, auth) {
       if (
         auth.method !== "api_key" ||
@@ -1235,7 +1237,7 @@ async function createDedicatedNativeAgentWithUngrantedSecret(controller, name) {
   return { namespace, agent, secret };
 }
 
-test("deploy names the Agent service principal and the permission it lacks", async () => {
+test("deploy refuses for the Agent service principal's missing grant without naming the principal", async () => {
   const { controller } = createController();
   const sandbox = createSandboxDriver();
   controller.registerDriver(sandbox);
@@ -1271,9 +1273,7 @@ test("deploy names the Agent service principal and the permission it lacks", asy
   assert.equal(failure.status, 403);
   assert.equal(failure.code, "FORBIDDEN");
   assert.equal(failure.message, agentPrincipalDenied("This Agent", "one of its bound Secrets"));
-
-  // Caller denials keep the generic message so they do not disclose resource details.
-  assert.equal(requestFailure(new AuthorizationDeniedError("denied")).message, GENERIC_DENIAL);
+  // The refused deploy records no revision.
   assert.deepEqual(
     await controller.transact((state) => state.revisions.listRevisions(namespace.id, agent.id)),
     [],

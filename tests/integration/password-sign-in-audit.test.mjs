@@ -9,6 +9,11 @@ import {
   knownDeviceFromCookieHeader,
   verifyKnownDevice,
 } from "../../apps/controller/src/auth/known-device.ts";
+import {
+  SIGN_IN_RATE_LIMITED_MINUTE,
+  SIGN_IN_UNAVAILABLE,
+  signInRateLimited,
+} from "../helpers/refusal-text.mjs";
 
 const require = createRequire(new URL("../../apps/controller/package.json", import.meta.url));
 const { memoryAdapter } = await import(require.resolve("better-auth/adapters/memory"));
@@ -21,8 +26,7 @@ const password = "audited-account-password";
 const secret = "password-sign-in-audit-secret-at-least-32-bytes";
 
 const REFUSED = "The caller did not provide valid authentication credentials.";
-const UNAVAILABLE =
-  "Sign-in is temporarily unavailable. Try again shortly. If it continues, ask an operator to check the API logs.";
+const UNAVAILABLE = SIGN_IN_UNAVAILABLE;
 
 // An outage and a rate limit each say what happened; neither reads as a wrong password.
 function assertUnavailable(response) {
@@ -39,7 +43,7 @@ function assertLimited(response) {
   assert.ok(seconds >= 1 && seconds <= 60, String(seconds));
   assert.deepEqual(response.payload.error, {
     code: "RATE_LIMITED",
-    message: `Too many attempts. Wait ${seconds === 1 ? "1 second" : `${seconds} seconds`}, then try again.`,
+    message: signInRateLimited(seconds),
   });
 }
 
@@ -334,7 +338,7 @@ test("guarded profile: a spent provider result budget says to wait a minute, wit
   assert.equal(limited.headers["retry-after"], undefined);
   assert.deepEqual(limited.payload.error, {
     code: "RATE_LIMITED",
-    message: "Too many attempts. Wait a minute, then try again.",
+    message: SIGN_IN_RATE_LIMITED_MINUTE,
   });
 });
 

@@ -9,15 +9,11 @@ import type {
 } from "@openclaw-enterprise/contracts";
 import type { Static } from "typebox";
 import { type RequestOptions, requestFailure } from "../api-client.mjs";
-import { button, element, setText, statusBlock } from "../dom.mjs";
+import { button, element, setText, statusBlock, requestIdLine } from "../dom.mjs";
 import type { createDraftStore } from "../drafts.mjs";
+import { DELETE_CONFIRMATION, stopConfirmation, keptResources } from "./lifecycle-confirmation.mjs";
 import {
-  DELETE_CONFIRMATION,
-  STOP_CONFIRMATION,
-  keptResources,
-} from "./lifecycle-confirmation.mjs";
-import {
-  AGENT_CREATE_DENIED,
+  agentCreateDenied,
   AGENT_DELETE_DENIED,
   AGENT_STOP_DENIED,
   askForGrant,
@@ -194,9 +190,24 @@ export function renderAgentList(context: AgentListContext) {
   // Agents whose last row action had a conflicting or unconfirmed outcome. Their actions stay
   // disabled until Refresh rereads the list, so the console never repeats an uncertain write.
   const unsettled = new Set<string>();
-  // Agents whose latest deployment failed before any version was selected: as on Agent detail,
-  // nothing runs, so there is nothing to stop (finding 2385).
-  const failedFirstDeployments = new Set<string>();
+  // Each row's latest deployment outcome, once its read shows one. With no version selected, a
+  // failed one leaves nothing to stop, as on Agent detail (finding 2385), and one queued or in
+  // progress makes the row's Stop dialog say it cancels that deployment (finding D691). A row
+  // without one (no visible deployment, or a failed read) keeps Stop: the API answers.
+  const latestDeployments = new Map<string, string>();
+  const failedFirst = (item: AgentRead) =>
+    !item.activeRevisionId && latestDeployments.get(item.id) === "failed";
+  function setLatestDeployment(item: AgentRead, outcome: string | null) {
+    const before = failedFirst(item);
+    if (outcome) {
+      latestDeployments.set(item.id, outcome);
+    } else {
+      latestDeployments.delete(item.id);
+    }
+    if (failedFirst(item) !== before) {
+      updateRowActions(item.id);
+    }
+  }
   const rowControls = new Map<
     string,
     ReturnType<typeof rowActions> & {
@@ -215,6 +226,8 @@ export function renderAgentList(context: AgentListContext) {
   // enabled and then refused, and the note never pushes the table down (finding 1517). Gating
   // only: the API still authorizes creation, so an unknown answer keeps the control.
   const createDenied = context.permissions?.agents?.create === false;
+  // An administrator a Restriction keeps from creating still reads every Agent here (finding D759).
+  const sharedOnly = createDenied && context.permissions?.installation?.administer !== true;
   // A Namespace that is not ready names its status here, so the first sign is never a refused
   // Secret or submit, and one that takes no new Agent never invites creating one (finding 1895).
   let notReady = namespaceCreation(context.namespace);
@@ -257,7 +270,7 @@ export function renderAgentList(context: AgentListContext) {
           element(
             "p",
             { className: "muted", role: "status", id: "agents-create-denied" },
-            AGENT_CREATE_DENIED,
+            agentCreateDenied(context.permissions),
           ),
         ]
       : []),
@@ -376,21 +389,14 @@ export function renderAgentList(context: AgentListContext) {
           return;
         }
         if (result === null) {
+          setLatestDeployment(item, null);
           fill("No visible deployments");
           return;
         }
         const neutral = neutralDeploymentOutcome(result.status);
         // Each read decides again: a retained list rereads on resume, and a first deployment
         // retried since then (queued or deploying) keeps Stop, as on Agent detail (finding 2580).
-        const failedFirst = !neutral && result.status.status === "failed" && !item.activeRevisionId;
-        if (failedFirst !== failedFirstDeployments.has(item.id)) {
-          if (failedFirst) {
-            failedFirstDeployments.add(item.id);
-          } else {
-            failedFirstDeployments.delete(item.id);
-          }
-          updateRowActions(item.id);
-        }
+        setLatestDeployment(item, deploymentOutcome(result.status));
         const failure =
           !neutral && result.status.status === "failed"
             ? (result.status.error?.message ?? "Deployment failed.")
@@ -418,6 +424,7 @@ export function renderAgentList(context: AgentListContext) {
         if (!context.isCurrent()) {
           return;
         }
+        setLatestDeployment(item, null);
         fill(
           requestFailure(error).status === 403
             ? "Deployment access denied"
@@ -446,9 +453,7 @@ export function renderAgentList(context: AgentListContext) {
               "div",
               { className: "status", "data-tone": "danger", role: "alert" },
               element("p", { className: "status-body" }, error),
-              requestId
-                ? element("p", { className: "request-id" }, `Request ID: ${requestId}`)
-                : null,
+              requestId ? requestIdLine(requestId) : null,
             ),
           ]
         : []),
@@ -558,7 +563,7 @@ export function renderAgentList(context: AgentListContext) {
         notice:
           stopped.status === "deleting"
             ? `${item.name} is being deleted.`
-            : `Stop requested for ${item.name}. OCC will not start it again until you deploy a new version. Runtime shutdown completion is not exposed in Console.`,
+            : `Stop requested for ${item.name}. It will not start again until you deploy a new version. The console does not show when its runtime finishes shutting down.`,
       });
     } catch (error) {
       reportFailure(item, error, "stop");
@@ -590,7 +595,7 @@ export function renderAgentList(context: AgentListContext) {
     const description = element(
       "p",
       { id: "agent-row-confirm-description", "aria-live": "polite" },
-      stopping ? STOP_CONFIRMATION : DELETE_CONFIRMATION,
+      stopping ? stopConfirmation(item, latestDeployments.get(item.id)) : DELETE_CONFIRMATION,
     );
     const kept = stopping ? null : keptResources(item);
     const dialog = element("dialog", {
@@ -679,7 +684,7 @@ export function renderAgentList(context: AgentListContext) {
     const stopped = item.desiredRuntimeState === "stopped";
     // New Agents start stopped with no version, and a first deployment that failed selects none,
     // so there is nothing to stop yet; Agent detail shows no Stop control then either.
-    const neverStarted = !item.activeRevisionId && (stopped || failedFirstDeployments.has(item.id));
+    const neverStarted = !item.activeRevisionId && (stopped || failedFirst(item));
     const allowed = permissions.get(item.id);
     const canStop = neverStarted || allowed?.operate !== false;
     const canDelete = allowed?.delete !== false;
@@ -799,7 +804,7 @@ export function renderAgentList(context: AgentListContext) {
             {},
             query
               ? "No matching Agents"
-              : createDenied
+              : sharedOnly
                 ? "No Agents are shared with you"
                 : "No Agents yet",
           ),
@@ -811,7 +816,9 @@ export function renderAgentList(context: AgentListContext) {
               : createDenied
                 ? // Under the note above: say what the reader can expect, not invite creating
                   // (finding 1521).
-                  "Agents in this Namespace that are shared with you appear here."
+                  sharedOnly
+                  ? "Agents in this Namespace that are shared with you appear here."
+                  : "Agents in this Namespace appear here."
                 : notReady?.blocked
                   ? context.namespace?.status === "provisioning" && !notReady.missing
                     ? "You can create Agents here once this Namespace is ready."

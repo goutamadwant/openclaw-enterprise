@@ -22,6 +22,7 @@ import {
   apiRequests,
   asksBeforeUnload,
   consoleViewports,
+  denyRevisionRead,
   deploymentStatusResponse,
   detailUrl,
   fileBrowser,
@@ -34,6 +35,7 @@ import {
   persistedDeploymentError,
   recordLayoutShifts,
   routeFailedDeployment,
+  routeOneVersionPerPage,
   settledFetches,
   settledView,
   takeLayoutShifts,
@@ -52,7 +54,18 @@ import {
 } from "./console-deployment-activity-helpers.mjs";
 import { createRuntimeAuthFixture } from "./console-agents-runtime-auth-fixture.mjs";
 import { fileReadyNamespace } from "./console-ready-namespace.mjs";
-import { CONFIGURATION_EDITS_PENDING, LOG_TEXT_DENIED } from "../helpers/refusal-text.mjs";
+import {
+  CONFIGURATION_EDITS_PENDING,
+  LOG_TEXT_DENIED,
+  NEW_VERSIONS_READ,
+  STOP_CANCELS_FIRST_DEPLOYMENT,
+  STOP_CONFIRMATION,
+  STOP_FIRST_DEPLOYMENT_CONFIRMATION,
+  STOP_REQUESTED_FIRST_DEPLOYMENT,
+  STOP_RUNNING_VERSION,
+  STOP_UNKNOWN_DEPLOYMENT_CONFIRMATION,
+  NO_TEST_REQUEST,
+} from "../helpers/refusal-text.mjs";
 
 // The Agent page's first screen while its reads settle and its polls run: loading cues, quiet
 // polls, a steady layout, and failed-version recovery scoped to the caller.
@@ -283,17 +296,6 @@ test("the Share Agent form shows disabled while the sharing policy loads", async
   assert.ok(Math.abs(after.y - before.y) < 1, `the grants moved ${after.y - before.y}px`);
 });
 
-function denyRevisionRead(fixture, namespace, revision) {
-  fixture.policy.restrictions.push({
-    id: `deny-read-${revision.id}`,
-    namespaceId: namespace.id,
-    resourceKind: "agent_revision",
-    resourceId: revision.id,
-    action: "read",
-    effect: "deny",
-  });
-}
-
 // The overview's "Deployment needs attention" recovery speaks for the version that is current
 // for this caller, and offers only the links that caller may use (finding 1458).
 test("A failed older version raises no recovery while the current version is hidden", async (t) => {
@@ -317,7 +319,9 @@ test("A failed older version raises no recovery while the current version is hid
   await page
     .locator(".agent-status-line")
     .getByText(
-      /The current version, rev_.*, is one you cannot read, so this page cannot tell whether the failed v1 deployment affects it\. Each new version needs its own AgentRevision read/,
+      new RegExp(
+        `The current version, rev_.*, is one you cannot read, so this page cannot tell whether the failed v1 deployment affects it\\. ${RegExp.escape(NEW_VERSIONS_READ)}`,
+      ),
     )
     .waitFor();
   assert.equal(await page.locator(".deployment-recovery").isHidden(), true);
@@ -430,32 +434,11 @@ for (const [code, outcome] of [
 }
 
 // A first deployment that failed leaves the Agent requested to run with no version selected
-// (finding 2385). Stop would change nothing, so the danger zone disables it and says why,
-// instead of offering to stop "the running version".
-test("Stop is disabled with its reason when a failed first deployment left nothing running", async (t) => {
-  const { fixture, namespace, agent, page } = await agentPage(t, "Failed first", "Failed first");
-  const failed = await fixture.deployAgent(namespace.id, agent.id);
-  await routeFailedRecord(page, fixture, namespace, agent, failed);
-
-  await login(page, fixture, detailUrl(fixture, namespace.id, agent.id, "draft", "configuration"));
-  const summary = page.locator(".agent-current-summary");
-  await summary.getByText("v1 · Failed", { exact: true }).waitFor();
-  const stopRegion = page.getByRole("region", { name: "Stop Agent", exact: true });
-  await stopRegion
-    .getByText(
-      "No version is running, so there is nothing to stop. Deploy a new version to start this Agent.",
-      { exact: true },
-    )
-    .waitFor();
-  assert.equal(
-    await stopRegion.getByRole("button", { name: "Stop Agent", exact: true }).isDisabled(),
-    true,
-  );
-});
-
-// The Agents list follows the detail page: once the row's deployment read shows the failed first
-// deployment, the row offers no Stop, while Delete stays (catalog rows 49 and 58, finding 2548).
-test("the Agents list hides Stop when a failed first deployment left nothing running", async (t) => {
+// (findings 2385, D691). Stop would change nothing, so neither the Agent page's danger zone nor
+// the Agents list offers it, instead of offering to stop "the running version". The list follows
+// the detail page once the row's deployment read shows the failed first deployment, while Delete
+// stays (catalog rows 49 and 58, finding 2548).
+test("Stop is hidden when a failed first deployment left nothing running", async (t) => {
   const { fixture, namespace, agent, page } = await agentPage(t, "Failed list", "Failed list");
   const failed = await fixture.deployAgent(namespace.id, agent.id);
   await routeFailedRecord(page, fixture, namespace, agent, failed);
@@ -470,6 +453,9 @@ test("the Agents list hides Stop when a failed first deployment left nothing run
   // and a retried first deployment that is queued keeps Stop, as on Agent detail (finding 2580).
   await row.getByRole("link", { name: "Failed list", exact: true }).click();
   await page.getByRole("region", { name: "Agent state at a glance" }).waitFor();
+  await page.locator(".agent-current-summary").getByText("v1 · Failed", { exact: true }).waitFor();
+  await page.getByRole("region", { name: "Delete Agent", exact: true }).waitFor();
+  assert.equal(await page.getByRole("region", { name: "Stop Agent", exact: true }).count(), 0);
   const retried = await fixture.deployAgent(namespace.id, agent.id);
   await page.route(deploymentRecordUrl(fixture, namespace.id, agent.id, retried.id), (route) =>
     route.fulfill(deploymentStatusResponse(retried, { status: "queued" })),
@@ -479,9 +465,10 @@ test("the Agents list hides Stop when a failed first deployment left nothing run
   await waitForEnabled(row.getByRole("button", { name: "Stop Failed list", exact: true }));
 });
 
-// Only a failed first deployment leaves nothing to stop. While a first deployment is still queued
-// no version is current either, but Stop ends that deployment, so it stays enabled.
-test("Stop stays enabled while a first deployment is queued", async (t) => {
+// Only a first deployment in progress gives an Agent with no current version something to stop.
+// While it is still queued, Stop stays enabled and says it cancels that deployment: no gateway
+// runs yet to interrupt (finding D691).
+test("Stop stays enabled and says it cancels a first deployment that is queued", async (t) => {
   const { fixture, namespace, agent, page } = await agentPage(t, "Queued first", "Queued first");
   const queued = await fixture.deployAgent(namespace.id, agent.id);
   await page.route(deploymentRecordUrl(fixture, namespace.id, agent.id, queued.id), (route) =>
@@ -492,8 +479,114 @@ test("Stop stays enabled while a first deployment is queued", async (t) => {
   const summary = page.locator(".agent-current-summary");
   await summary.getByText("v1 · Queued", { exact: true }).waitFor();
   const stopRegion = page.getByRole("region", { name: "Stop Agent", exact: true });
-  await waitForEnabled(stopRegion.getByRole("button", { name: "Stop Agent", exact: true }));
+  const stop = stopRegion.getByRole("button", { name: "Stop Agent", exact: true });
+  await waitForEnabled(stop);
   assert.equal(await stopRegion.getByText(/nothing to stop/).count(), 0);
+  await stopRegion.getByText(STOP_CANCELS_FIRST_DEPLOYMENT, { exact: true }).waitFor();
+  await stop.click();
+  const dialog = page.getByRole("dialog", { name: "Stop this Agent?" });
+  await dialog.getByText(STOP_FIRST_DEPLOYMENT_CONFIRMATION, { exact: true }).waitFor();
+  assert.equal(await dialog.getByText(/runtime gateway/).count(), 0);
+  await dialog.getByRole("button", { name: "Stop Agent", exact: true }).click();
+  await stopRegion.getByText(STOP_REQUESTED_FIRST_DEPLOYMENT, { exact: true }).waitFor();
+});
+
+// Stop hides only when the page read a failed first deployment. A first deployment that
+// succeeded while the page still holds the Agent read from before it, or one whose outcome the
+// page could not read, may have a version running: Stop stays, and its dialog never claims that no
+// version is serving (finding D691). The API answers if nothing runs.
+test("Stop stays when the Agents list's Agent read is older than a first deployment that succeeded", async (t) => {
+  const { fixture, namespace, agent, page } = await agentPage(t, "Stale list", "Stale list");
+  const first = await fixture.deployAgent(namespace.id, agent.id);
+  // The deployment completes and selects its version after the list read the Agents but before
+  // the row reads its deployment, so the row's Agent still has no version selected.
+  let activated = false;
+  await page.route(
+    deploymentRecordUrl(fixture, namespace.id, agent.id, first.id),
+    async (route) => {
+      if (!activated) {
+        activated = true;
+        await fixture.activateRevision(namespace.id, agent.id, first.id);
+      }
+      await route.fulfill(deploymentStatusResponse(first, { status: "succeeded" }));
+    },
+  );
+
+  await login(page, fixture, `/console/agents?namespace=${namespace.id}`);
+  const row = page.getByRole("row").filter({ hasText: "Stale list" });
+  await row.getByText("v1 · Completed", { exact: true }).waitFor();
+  const stop = row.getByRole("button", { name: "Stop Stale list", exact: true });
+  await waitForEnabled(stop);
+  await stop.click();
+  const dialog = page.getByRole("dialog", { name: "Stop Stale list?" });
+  await dialog.getByText(STOP_CONFIRMATION, { exact: true }).waitFor();
+  assert.equal(await dialog.getByText(/No version is serving yet/).count(), 0);
+});
+
+test("Agent detail keeps Stop when its Agent reread fails after a first deployment succeeded", async (t) => {
+  const { fixture, namespace, agent, page } = await agentPage(t, "Reread fails", "Reread fails");
+  const first = await fixture.deployAgent(namespace.id, agent.id);
+  const recordUrl = deploymentRecordUrl(fixture, namespace.id, agent.id, first.id);
+  let status = "queued";
+  await page.route(recordUrl, (route) =>
+    route.fulfill(deploymentStatusResponse(first, { status })),
+  );
+
+  await login(page, fixture, detailUrl(fixture, namespace.id, agent.id, "draft", "configuration"));
+  const summary = page.locator(".agent-current-summary");
+  await summary.getByText("v1 · Queued", { exact: true }).waitFor();
+  const stopRegion = page.getByRole("region", { name: "Stop Agent", exact: true });
+  await waitForEnabled(stopRegion.getByRole("button", { name: "Stop Agent", exact: true }));
+
+  // The deployment completes and selects its version, but the Agent reread that Refresh
+  // deployment makes fails: the page still holds the Agent read with no version selected.
+  await fixture.activateRevision(namespace.id, agent.id, first.id);
+  status = "succeeded";
+  await page.route(
+    `${fixture.origin}/namespaces/${namespace.id}/agents/${agent.id}`,
+    (route, request) =>
+      request.method() === "GET"
+        ? route.fulfill(apiErrorResponse(503, "DEPENDENCY_UNAVAILABLE", "Service unavailable."))
+        : route.continue(),
+  );
+  const activity = await openDeploymentActivity(page);
+  await activity.getByRole("button", { name: "Refresh deployment" }).click();
+  await summary.getByText("v1 · Completed", { exact: true }).waitFor();
+  const stop = stopRegion.getByRole("button", { name: "Stop Agent", exact: true });
+  await waitForEnabled(stop);
+  await stopRegion.getByText(STOP_RUNNING_VERSION, { exact: true }).waitFor();
+  await stop.click();
+  const dialog = page.getByRole("dialog", { name: "Stop this Agent?" });
+  await dialog.getByText(STOP_CONFIRMATION, { exact: true }).waitFor();
+});
+
+test("Stop stays when a first deployment's record cannot be read", async (t) => {
+  const { fixture, namespace, agent, page } = await agentPage(t, "Unread first", "Unread first");
+  const first = await fixture.deployAgent(namespace.id, agent.id);
+  await page.route(deploymentRecordUrl(fixture, namespace.id, agent.id, first.id), (route) =>
+    route.fulfill(apiErrorResponse(503, "DEPENDENCY_UNAVAILABLE", "Service unavailable.")),
+  );
+
+  await login(page, fixture, `/console/agents?namespace=${namespace.id}`);
+  const row = page.getByRole("row").filter({ hasText: "Unread first" });
+  await row.getByText("Deployment unavailable", { exact: true }).waitFor();
+  const rowStop = row.getByRole("button", { name: "Stop Unread first", exact: true });
+  await waitForEnabled(rowStop);
+  await rowStop.click();
+  let dialog = page.getByRole("dialog", { name: "Stop Unread first?" });
+  // Without the outcome, the dialog names both things Stop may do.
+  await dialog.getByText(STOP_UNKNOWN_DEPLOYMENT_CONFIRMATION, { exact: true }).waitFor();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await dialog.waitFor({ state: "hidden" });
+
+  await row.getByRole("link", { name: "Unread first", exact: true }).click();
+  await page.locator(".agent-current-summary").getByText("v1 · Unavailable").waitFor();
+  const stopRegion = page.getByRole("region", { name: "Stop Agent", exact: true });
+  const stop = stopRegion.getByRole("button", { name: "Stop Agent", exact: true });
+  await waitForEnabled(stop);
+  await stop.click();
+  dialog = page.getByRole("dialog", { name: "Stop this Agent?" });
+  await dialog.getByText(STOP_UNKNOWN_DEPLOYMENT_CONFIRMATION, { exact: true }).waitFor();
 });
 
 // The failed first version's own page (finding 2403) said "Not verified" for Live serving while
@@ -663,7 +756,7 @@ test("Live serving shows a lost Sandbox and its next step without moving the pag
     delete sandboxDriver.observeHarness;
     try {
       const { page } = await openOverview(consoleViewports[0]);
-      await liveServing(page).getByText("OCC sends no test request.", { exact: true }).waitFor();
+      await liveServing(page).getByText(NO_TEST_REQUEST, { exact: true }).waitFor();
       assert.equal(await liveServing(page).locator(".badge").textContent(), "Not verified");
     } finally {
       sandboxDriver.observeHarness = observeHarness;
@@ -888,31 +981,6 @@ test("Recovery's Open Configuration follows whether the caller may edit the Conf
   assert.deepEqual(await links(), ["Open v1 Logs"]);
 });
 
-// One readable version per history page: the first page lists the newest readable version.
-// `olderRead`, when given, is told of each older-page request and answers when it resolves.
-function routeOneVersionPerPage(page, fixture, namespace, agent, olderRead) {
-  const revisionsPath = `/namespaces/${namespace.id}/agents/${agent.id}/revisions`;
-  return page.route(
-    (url) => url.origin === fixture.origin && url.pathname === revisionsPath,
-    async (route) => {
-      const cursor = new URL(route.request().url()).searchParams.get("cursor");
-      if (cursor === "older-page") {
-        await olderRead?.();
-      }
-      const response = await route.fetch({ url: `${fixture.origin}${revisionsPath}` });
-      const body = await response.json();
-      await route.fulfill({
-        response,
-        json: {
-          ...body,
-          data: cursor === "older-page" ? body.data.slice(1) : body.data.slice(0, 1),
-          meta: { ...body.meta, nextCursor: cursor === "older-page" ? null : "older-page" },
-        },
-      });
-    },
-  );
-}
-
 test("A failed version raises no recovery while the current version is on no loaded page", async (t) => {
   const { fixture, namespace, agent, page } = await agentPage(t, "Paged history", "Paged history");
   const first = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
@@ -999,7 +1067,9 @@ test("A failed version raises no recovery while the current version is on no loa
   assert.equal(await page.getByRole("button", { name: "Show older versions" }).count(), 0);
   await statusLine
     .getByText(
-      /The current version, rev_.*, is one you cannot read, so this page cannot tell whether the failed v2 deployment affects it\. Each new version needs its own AgentRevision read/,
+      new RegExp(
+        `The current version, rev_.*, is one you cannot read, so this page cannot tell whether the failed v2 deployment affects it\\. ${RegExp.escape(NEW_VERSIONS_READ)}`,
+      ),
     )
     .waitFor();
   assert.equal(await page.locator(".deployment-recovery").isHidden(), true);
@@ -1319,7 +1389,7 @@ for (const c of [
   },
   {
     code: "DEPENDENCY_UNAVAILABLE",
-    step: "Deploy again; if it keeps failing, ask an admin to check the controller worker log.",
+    step: "Deploy again; if it keeps failing",
     action: "Deploy again",
     primary: "Deploy again",
   },

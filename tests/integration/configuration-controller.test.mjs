@@ -24,11 +24,15 @@ import {
   signInToControllerApp,
 } from "../helpers/auth-session.mjs";
 import { bindRole } from "../helpers/iam-grants.mjs";
+import { assertSameAnswer } from "../helpers/refusal-answers.mjs";
 import { syntheticCredentialUrl } from "../fixtures/synthetic-credential-url.mjs";
 import {
   referenceFormRefusal,
-  sentIdHidden,
+  unboundReferenceRefusal,
   unreadableSlackTokenRefusal,
+  unsubstitutedFallbackRefusal,
+  unsubstitutedReferenceRefusal,
+  codexApiKeyRefusal,
 } from "../helpers/refusal-text.mjs";
 import { temporaryDirectory } from "../helpers/temporary-directory.mjs";
 
@@ -379,19 +383,6 @@ async function writePastOcc(configurationDriver, configurationId, values) {
 
 // The refusal texts the save rules name a field or setting with.
 const setting = (path, requirement) => `Configuration setting ${path} ${requirement}.`;
-const unboundChannelReference = (path, name) =>
-  setting(
-    path,
-    `references ${name} without a Configuration Secret binding: bind ${name} in secretBindings to an environment-backed Secret, or remove the reference`,
-  );
-// A channel credential `${` the runtime does not substitute (finding 2477), shown as a plain
-// `${name}` or, for other text, only described.
-const useUppercase =
-  "use an uppercase ${NAME} bound to a Secret in secretBindings, or escape literal text as $${NAME}";
-const unsubstitutedChannelReference = (path, shown) =>
-  setting(path, `contains ${shown}, which the runtime does not substitute: ${useUppercase}`);
-const unsubstitutedChannelText = (path) =>
-  setting(path, `contains a \${ the runtime does not substitute: ${useUppercase}`);
 // A Slack token SecretRef the Slack Channel Driver cannot read (finding 2514).
 const unreadableSlackReference = (path) => unreadableSlackTokenRefusal(path, "secretRef");
 const absoluteUrl = (field) =>
@@ -1478,8 +1469,8 @@ test("Configuration create, update and Agent create's check refuse a channel cre
     },
   });
   const slack = slackWith({});
-  const botRefusal = unboundChannelReference("channels.slack.botToken", "SLACK_BOT_TOKEN");
-  const appRefusal = unboundChannelReference("channels.slack.appToken", "SLACK_APP_TOKEN");
+  const botRefusal = unboundReferenceRefusal("channels.slack.botToken", "SLACK_BOT_TOKEN");
+  const appRefusal = unboundReferenceRefusal("channels.slack.appToken", "SLACK_APP_TOKEN");
   const unchanged = async (label) =>
     assert.deepEqual((await request(context.app, "GET", item)).body.data, created.body.data, label);
 
@@ -1538,7 +1529,7 @@ test("Configuration create, update and Agent create's check refuse a channel cre
         secretBindings: bothBindings,
       },
     }),
-    unboundChannelReference("channels.slack.accounts.work.botToken", "WORK_BOT_TOKEN"),
+    unboundReferenceRefusal("channels.slack.accounts.work.botToken", "WORK_BOT_TOKEN"),
     { label: "named account" },
   );
   // A binding is an own key: an inherited name such as `constructor` binds nothing.
@@ -1549,7 +1540,7 @@ test("Configuration create, update and Agent create's check refuse a channel cre
         secretBindings: bothBindings,
       },
     }),
-    unboundChannelReference("channels.slack.botToken", "constructor"),
+    unboundReferenceRefusal("channels.slack.botToken", "constructor"),
     { label: "inherited name" },
   );
   // The runtime does not substitute a lowercase name, so it would send `${constructor}` itself as
@@ -1558,7 +1549,7 @@ test("Configuration create, update and Agent create's check refuse a channel cre
     await request(context.app, "PATCH", item, {
       body: { values: slackWith({ botToken: "${constructor}" }), secretBindings: bothBindings },
     }),
-    unsubstitutedChannelReference("channels.slack.botToken", "${constructor}"),
+    unsubstitutedReferenceRefusal("channels.slack.botToken", "${constructor}"),
     { label: "lowercase name" },
   );
   const disabled = await request(context.app, "PATCH", item, {
@@ -1783,7 +1774,7 @@ for (const computeImplementation of ["occ/kubernetes", "kubernetes-local"]) {
     // The first channel's references are bound; the second channel's is not.
     assertRefused(
       await create(slackBindings),
-      unboundChannelReference("channels.msteams.appPassword", "MSTEAMS_APP_PASSWORD"),
+      unboundReferenceRefusal("channels.msteams.appPassword", "MSTEAMS_APP_PASSWORD"),
     );
     const allBindings = {
       ...slackBindings,
@@ -1811,7 +1802,7 @@ for (const computeImplementation of ["occ/kubernetes", "kubernetes-local"]) {
         await request(context.app, "PATCH", `${collection}/${saved.body.data.id}`, {
           body: { values: withAppPassword(appPassword), secretBindings: allBindings },
         }),
-        unboundChannelReference("channels.msteams.appPassword", "MSTEAMS_TENANT_SECRET"),
+        unboundReferenceRefusal("channels.msteams.appPassword", "MSTEAMS_TENANT_SECRET"),
         { label: appPassword },
       );
     }
@@ -1823,15 +1814,12 @@ for (const computeImplementation of ["occ/kubernetes", "kubernetes-local"]) {
     for (const [appPassword, message] of [
       [
         "${msteams_password}",
-        unsubstitutedChannelReference("channels.msteams.appPassword", "${msteams_password}"),
+        unsubstitutedReferenceRefusal("channels.msteams.appPassword", "${msteams_password}"),
       ],
-      [`\${${secretText}}`, unsubstitutedChannelText("channels.msteams.appPassword")],
+      [`\${${secretText}}`, unsubstitutedReferenceRefusal("channels.msteams.appPassword")],
       [
         `${secretText}\${MSTEAMS_APP_PASSWORD-${secretText}}`,
-        setting(
-          "channels.msteams.appPassword",
-          "contains ${MSTEAMS_APP_PASSWORD-…}, which the runtime does not substitute: write a fallback as ${MSTEAMS_APP_PASSWORD:-text}, with MSTEAMS_APP_PASSWORD bound to a Secret in secretBindings",
-        ),
+        unsubstitutedFallbackRefusal("channels.msteams.appPassword", "MSTEAMS_APP_PASSWORD"),
       ],
     ]) {
       assertRefused(
@@ -1849,7 +1837,7 @@ for (const computeImplementation of ["occ/kubernetes", "kubernetes-local"]) {
       await request(context.app, "PATCH", `${collection}/${saved.body.data.id}`, {
         body: { values: withAppPassword(`\${${identifierToken}}`), secretBindings: allBindings },
       }),
-      unsubstitutedChannelText("channels.msteams.appPassword"),
+      unsubstitutedReferenceRefusal("channels.msteams.appPassword"),
       { label: identifierToken, sentinel: identifierToken },
     );
     for (const appPassword of [
@@ -1891,7 +1879,7 @@ for (const computeImplementation of ["occ/kubernetes", "kubernetes-local"]) {
       }),
       {
         name: "ConfigurationHarnessError",
-        message: unboundChannelReference("channels.slack.appToken", "SLACK_APP_TOKEN"),
+        message: unboundReferenceRefusal("channels.slack.appToken", "SLACK_APP_TOKEN"),
       },
     );
     assert.deepEqual(
@@ -2061,10 +2049,7 @@ test("Configuration save refuses a model selection or apiKey off the primary mod
         agents: { defaults: codexDefaults },
         models: { providers: { codex: { apiKey } } },
       };
-      const message = setting(
-        "models.providers.codex.apiKey",
-        "must be unset: Dedicated Codex receives model credentials from the Agent's Harness authentication binding",
-      );
+      const message = codexApiKeyRefusal("models.providers.codex.apiKey");
       await refusedOnSave(context, values, message, { item: codex });
     }
   });
@@ -2115,36 +2100,28 @@ test("Configuration save refuses a model selection or apiKey off the primary mod
     });
     assert.equal(unused.status, 201, JSON.stringify(unused.body));
     const role = context.roles.find(({ id }) => id === "role-configuration-integration");
-    const answers = async (values) => {
-      const responses = [];
-      for (const path of [item, `${collection}/${unused.body.data.id}`]) {
-        const { status, body } = await request(context.app, "PATCH", path, { body: { values } });
-        // A denial names the Configuration ID this request sent, and nothing else about it.
-        const error =
-          body.error === undefined
-            ? undefined
-            : { ...body.error, message: sentIdHidden(body.error.message, path.split("/").at(-1)) };
-        responses.push({ status, error });
-      }
-      assert.deepEqual(responses[0], responses[1], JSON.stringify(values));
-      return responses[0];
-    };
+    // The same PATCH to the used and the unused Configuration; a denial may name only the ID
+    // its request sent.
+    const answers = (values, status) =>
+      assertSameAnswer(
+        (id) => request(context.app, "PATCH", `${collection}/${id}`, { body: { values } }),
+        [item.split("/").at(-1), unused.body.data.id],
+        { status, label: JSON.stringify(values) },
+      );
     role.permissions = [
       { action: "read", resourceKind: "configuration" },
       { action: "update", resourceKind: "configuration" },
     ];
     const memberAgentRead = await request(context.app, "GET", agentPath);
     assert.equal(memberAgentRead.status, 403, JSON.stringify(memberAgentRead.body));
-    const refused = await answers(offProvider[1][0]);
-    assert.equal(refused.status, 400);
-    assert.equal(refused.error.message, offProvider[1][1]);
-    assert.equal((await answers(valid)).status, 200);
+    const refused = await answers(offProvider[1][0], 400);
+    assert.equal(refused.message, offProvider[1][1]);
+    await answers(valid, 200);
     // A zero-grant member gets the uniform 403, whatever the values.
     role.permissions = [];
     for (const values of [valid, offProvider[1][0]]) {
       const denied = await answers(values);
-      assert.equal(denied.status, 403);
-      assert.equal(denied.error.code, "FORBIDDEN");
+      assert.equal(denied.code, "FORBIDDEN");
     }
   });
 });
@@ -2294,10 +2271,7 @@ test("Preset save refuses a model selection or apiKey off the primary model's pr
         },
         models: { providers: { codex: { apiKey: "${OPENAI_API_KEY}" } } },
       },
-      setting(
-        "models.providers.codex.apiKey",
-        "must be unset: Dedicated Codex receives model credentials from the Agent's Harness authentication binding",
-      ),
+      codexApiKeyRefusal("models.providers.codex.apiKey"),
     ],
   ];
   const launch = (template) =>

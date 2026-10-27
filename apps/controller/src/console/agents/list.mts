@@ -9,10 +9,15 @@ import { GENERIC_DENIAL, namedDenial, requestFailure, responseFields } from "../
 import { element } from "../dom.mjs";
 import type { createNavigation } from "../navigation.mjs";
 import {
+  ACCESS_NOT_INCLUDED,
+  AGENT_PAGE_READ_DENIED,
+  AGENT_SAVE_REFUSED,
   ASK_INSTALLATION_ADMINISTRATOR,
   askAdministratorTo,
   askForGrant,
+  CONFIGURATION_SAVE_REFUSED,
   notIncluded,
+  SAVE_READ_REFUSED,
 } from "./access-reasons.mjs";
 
 export const displayDate = (value: string) => new Date(value).toLocaleString();
@@ -36,8 +41,9 @@ export function link(label: string, target: string, context: AgentNavigation) {
 // A Namespace that is still provisioning (or failed to) refuses Agent, Configuration and
 // deployment writes with NAMESPACE_NOT_READY; "conflicts with the saved state" would send the
 // operator to the wrong place.
+// Every view that meets NAMESPACE_NOT_READY shows this one sentence (finding 2538).
 export const NAMESPACE_NOT_READY_MESSAGE =
-  "This Namespace is not ready yet. Check its status on the Namespaces page: a provisioning Namespace becomes ready when its Kubernetes setup completes (on Kubernetes installs, after an operator grants the tenant RoleBindings).";
+  "This Namespace is not ready yet. Check its status on the Namespaces page: a provisioning Namespace becomes ready when its Kubernetes setup completes. If it stays provisioning, ask an operator to finish that setup.";
 
 // Why a Namespace can't take new Agents, by status. Neither becomes ready by waiting.
 const NOT_READY_REASONS: Partial<Record<Namespace["status"], string>> = {
@@ -115,8 +121,11 @@ export const namespaceListNeed = (items: string): AccessNeed => ({
   grant: "Namespace read",
 });
 
-// A 403 that names no grant. message() adds who grants access; administratorMessage() does not.
-const PLAIN_ACCESS_DENIED = "Access denied. You do not have permission for this operation.";
+// The Stop and Delete pages reread the Agent for its status, which authorizes Agent read.
+export const AGENT_STATUS_READ_NEED: AccessNeed = {
+  task: "reading this Agent's status",
+  grant: "Agent read on it",
+};
 
 // The API records these deployment endings as failed, but nothing went wrong with the version,
 // so the console shows a neutral outcome instead. A newer version took over before this one
@@ -176,7 +185,7 @@ export const NEUTRAL_DEPLOYMENT_NOTES = {
 export function administratorMessage(cause: unknown): string {
   const error = responseFields(cause);
   return error.status === 403 && typeof error.refusal !== "string"
-    ? PLAIN_ACCESS_DENIED
+    ? ACCESS_NOT_INCLUDED
     : message(cause);
 }
 
@@ -203,7 +212,7 @@ export function message(cause: unknown, mutation = false, need?: AccessNeed): st
       : need
         ? notIncluded(need.task, need.grant)
         : (namedDenial(cause) ??
-          `${PLAIN_ACCESS_DENIED} ${askAdministratorTo("check your access")}`);
+          `${ACCESS_NOT_INCLUDED} ${askAdministratorTo("check your access")}`);
   }
   if (error.status === 404) {
     return "Resource unavailable in this Namespace. Check the ID and your access.";
@@ -264,20 +273,34 @@ export function preAdmissionRefusal(cause: unknown) {
 
 // A refused save names the grants it needs, as Stop, Delete and occ do (finding 1530). Each save
 // shows one fixed text for every 403, so it says nothing the server did not: no IDs, and nothing
-// about whether a resource exists.
+// about whether a resource exists. The API's named denial would show the saved resource's raw ID
+// where this names it in words.
 export const SAVE_REFUSALS = Object.freeze({
-  configuration: `You do not have permission to save this Configuration. ${askForGrant(
-    "Configuration update on it, plus Secret operate on each Secret it binds",
-  )}`,
-  agent: `You do not have permission to save this Agent. ${askForGrant(
-    "Agent update and Configuration read on it, plus access to the Secrets, credential sources and Service Account it binds",
-  )}`,
-  // A save first rereads the Agent and its Configuration; a refused read is not a refused
-  // update (finding 1540).
-  read: `You do not have permission to read this Agent's saved settings. ${askForGrant(
-    "Agent read and Configuration read on it",
-  )}`,
+  configuration: CONFIGURATION_SAVE_REFUSED,
+  agent: AGENT_SAVE_REFUSED,
+  managedMode: `Changing Gateway managed mode requires Installation administer, Agent update and Configuration read access, plus access to the Agent's bound resources. ${askAdministratorTo("change this setting")}`,
+  read: SAVE_READ_REFUSED,
 });
+
+const NAMED_DENIAL_PREFIX = "Not authorized: ";
+
+/**
+ * The API's named denial after the refused action ("Slack lookup was refused: this needs Secret
+ * operate on ..."), or undefined when the API named no grant. A request that checks several
+ * grants uses it: the API names the one it lacked, where the console's own text lists them all.
+ */
+export function namedRefusal(action: string, cause: unknown) {
+  const named = namedDenial(cause);
+  return named === undefined
+    ? undefined
+    : `${action} was refused: ${named.slice(NAMED_DENIAL_PREFIX.length)}`;
+}
+
+// Rechecking an open Agent page reads the Agent, its versions and the shown version or draft: the
+// API names the one grant it lacked.
+export function agentPageReadRefusal(cause: unknown) {
+  return namedDenial(cause) ?? AGENT_PAGE_READ_DENIED;
+}
 
 // A refused save that binds Secrets a permission answer read after the refusal says the caller
 // may not operate: it names them and that grant, not the Configuration update the caller may
@@ -286,7 +309,7 @@ export function secretOperateRefusal(names: readonly string[]) {
   const them = names.length > 1 ? "them" : "it";
   const listed =
     names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
-  return `You do not have permission to bind ${listed}. Each save needs Secret operate on every Secret it binds, which your access does not include for ${them}. Choose another Secret, or ${ASK_INSTALLATION_ADMINISTRATOR} for Secret operate on ${them}.`;
+  return `Save was refused: your access does not include Secret operate on ${listed}, which each save needs on every Secret it binds. Choose another Secret, or ${ASK_INSTALLATION_ADMINISTRATOR} for Secret operate on ${them}.`;
 }
 
 // Shown beside Agent-side save controls when the caller's permission answer denies Agent update.
@@ -333,7 +356,7 @@ export function agentSaveDenial(
 // A refused write that a fresh Secret answer explains says so instead (`named`, finding 2453).
 export function refusedSave<Cause>(
   cause: Cause,
-  save: "configuration" | "agent",
+  save: "configuration" | "agent" | "managedMode",
   written: boolean,
   named?: string,
 ) {
@@ -425,11 +448,13 @@ export function describeFailure(
     form = false,
     next,
     conflict = "The request conflicts with the current state.",
+    need,
   }: {
     mutation?: boolean;
     form?: boolean;
     next?: string;
     conflict?: string;
+    need?: AccessNeed;
   } = {},
 ): string {
   const error = requestFailure(cause);
@@ -457,8 +482,36 @@ export function describeFailure(
   if (error.status === 429) {
     return tooManyRequests(cause);
   }
-  return message(cause, mutation);
+  return message(cause, mutation, need);
 }
+
+// An outage names who acts if it continues, as sign-in's 503 does.
+const READ_OUTAGE =
+  "The service did not answer. Try again; if it continues, ask an operator to check the API.";
+
+// Why a read failed and what to do next, by status, for the views whose catch once said
+// "unavailable, retry" for a denial and an outage alike (finding 2538): a 403 names the grant
+// (`need`) and who grants it, a 429 how long to wait, and an outage who to ask if it continues.
+export function readFailureReason(cause: unknown, need?: AccessNeed): string {
+  const error = requestFailure(cause);
+  if (error.status === 403) {
+    return message(cause, false, need);
+  }
+  if (error.status === 404) {
+    return "It is no longer available. Refresh the page.";
+  }
+  if (error.status === 400 || error.status === 409 || error.status === 429) {
+    return describeFailure(cause);
+  }
+  const { name } = responseFields(cause);
+  return name === "TypeError" || name === "TimeoutError"
+    ? "The request was interrupted. Try again."
+    : READ_OUTAGE;
+}
+
+/** "<subject> could not be read. <reason>" for a failed read (readFailureReason). */
+export const readFailure = (subject: string, cause: unknown, need?: AccessNeed) =>
+  `${subject} could not be read. ${readFailureReason(cause, need)}`;
 
 // A channel credential value that Configuration save or provisioning refuses: a reference without
 // a Secret binding, a `${` the runtime does not substitute, or a value the setting "holds" that is

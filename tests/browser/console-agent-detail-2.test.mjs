@@ -64,11 +64,20 @@ import {
   DEPENDENCY_UNAVAILABLE,
   GENERIC_DENIAL,
   MALFORMED_REQUEST,
+  RESOURCE_CONFLICT,
   RESOURCE_NOT_FOUND,
   SANDBOX_POLICY_READ_DENIED,
+  STOP_REQUESTED,
+  STOPPED_NO_VERSION,
+  WORKSPACE_API_UNREACHABLE,
   WORKSPACE_FILES_UNAVAILABLE,
+  WORKSPACE_UNREACHABLE,
   askForGrant,
+  BOUND_SECRET_UNLISTED,
   notIncluded,
+  deleteRefused,
+  tooManyRequestsIn,
+  VERSION_READ_DENIED_HEADING,
 } from "../helpers/refusal-text.mjs";
 
 // The Console Browser lane runs the two Agent detail test files in parallel.
@@ -486,25 +495,17 @@ test("Repeat deletion preserves bounded retry ownership feedback and ordinary de
   };
   await confirm();
   await page.getByRole("alert").getByText(ownership, { exact: true }).waitFor();
-  await expectNoText(page, "Ask an Installation administrator for Agent delete on it", () =>
-    waitForIdleFetches(page),
-  );
+  await expectNoText(page, askForGrant("Agent delete on it"), () => waitForIdleFetches(page));
   assert.equal(writes, 1);
   await page.clock.fastForward(DELETION_POLL_MS * 2);
   await page.getByRole("alert").getByText(ownership, { exact: true }).waitFor();
   assert.equal(writes, 1);
   serverMessage = GENERIC_DENIAL;
   await confirm();
-  await page
-    .getByRole("alert")
-    .getByText("You do not have permission to delete this Agent", { exact: false })
-    .waitFor();
+  await page.getByRole("alert").getByText(deleteRefused("this Agent"), { exact: false }).waitFor();
   assert.equal(writes, 2);
   await page.clock.fastForward(DELETION_POLL_MS * 2);
-  await page
-    .getByRole("alert")
-    .getByText("You do not have permission to delete this Agent", { exact: false })
-    .waitFor();
+  await page.getByRole("alert").getByText(deleteRefused("this Agent"), { exact: false }).waitFor();
   await page.getByRole("button", { name: "Refresh deletion status", exact: true }).click();
   await page.getByRole("alert").waitFor({ state: "hidden" });
   assert.equal(writes, 2);
@@ -526,7 +527,7 @@ test("Agent page Stop shows the API's 400 and 409 reasons", async (t) => {
     [
       "generic conflict",
       409,
-      "The requested platform resource already exists.",
+      RESOURCE_CONFLICT,
       "This Agent lifecycle changed while stopping. Refresh stop status before trying again.",
     ],
   ]) {
@@ -1036,6 +1037,7 @@ test("Agent detail opens native admin UI only after real API access checks pass"
     authSecureCookies: true,
     nativeAdmin: { enabled: true, domain: nativeDomain, sharedCookieDomain: cookieDomain },
     nativeAdminGatewayApiKey: async () => "native-admin-gateway-api-key",
+    agentGatewayManagedMode: false,
     computeDriver: nativeAdminComputeDriver(gatewayEndpoint),
   });
   await fixture.bootstrap();
@@ -1268,6 +1270,7 @@ test("Agent detail rereads native admin access once when a pending deployment ac
     authSecureCookies: true,
     nativeAdmin: { enabled: true, domain: nativeDomain, sharedCookieDomain: cookieDomain },
     nativeAdminGatewayApiKey: async () => "native-admin-gateway-api-key",
+    agentGatewayManagedMode: false,
     computeDriver: nativeAdminComputeDriver(
       "wss://private-gateway.example.invalid/namespaces/native-admin/agents/agent",
     ),
@@ -1793,6 +1796,39 @@ test("a tab refused after a revoke makes the next tab change read the page again
   assert.equal(await page.locator(".version-selection-notice").count(), 0);
 });
 
+// Returning to an open Agent page rechecks the Agent, its versions and the shown version in
+// place. Those are three grants, so a refusal shows the one the API names instead of "You do not
+// have permission to read this Agent, its versions, or its Configuration" (finding D753).
+test("A refused recheck of an open Agent page names the grant the API checked", async (t) => {
+  const fixture = await createConsoleAppFixture(t);
+  await fixture.bootstrap();
+  const namespace = await fixture.createNamespace("Refused recheck", { ready: true });
+  const agent = await fixture.createAgent(namespace.id, "Refused recheck", nativeValues("rr"));
+  const { revision } = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
+  const member = await fixture.createNamespaceMember("refused-recheck", namespace.id, AGENT_READ);
+  const { page } = await newPage(t, fixture);
+  await login(
+    page,
+    fixture,
+    detailUrl(fixture, namespace.id, agent.id, revision.id, "configuration"),
+    member.credentials,
+  );
+  await page.getByRole("tab", { name: "Configuration", selected: true }).waitFor();
+  revokeMemberGrant(fixture, "refused-recheck", ["read", "agent"]);
+  const refused = page.waitForResponse(
+    (response) =>
+      response.url() === `${fixture.origin}/namespaces/${namespace.id}/agents/${agent.id}` &&
+      response.status() === 403,
+  );
+  await page.evaluate(() => {
+    globalThis.dispatchEvent(new Event("focus"));
+    globalThis.document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await refused;
+  await page.getByRole("heading", { name: "Access denied", exact: true }).waitFor();
+  await page.getByText(callerDenied("Agent read", `Agent ${agent.id}`), { exact: true }).waitFor();
+});
+
 for (const kind of ["agent", "configuration", "namespace"]) {
   test(`Agent detail refocus removes a revision when ${kind} access is revoked`, async (t) => {
     const fixture = await detailApp(t);
@@ -2265,6 +2301,7 @@ test("Agent sharing grants existing people exact discovery and native access, th
       sharedCookieDomain: cookieDomain,
     },
     nativeAdminGatewayApiKey: async () => "native-admin-gateway-api-key",
+    agentGatewayManagedMode: false,
     computeDriver: nativeAdminComputeDriver("wss://private-gateway.example.invalid/shared"),
   });
   await fixture.bootstrap();
@@ -2368,7 +2405,9 @@ test("Agent sharing grants existing people exact discovery and native access, th
   const recipientRequests = apiRequests(recipient, fixture.origin);
   await login(recipient, fixture, detail, person.credentials);
   // Agent sharing does not include version read, so the version pane says so.
-  await recipient.getByRole("heading", { name: "You cannot read this version" }).waitFor();
+  await recipient
+    .getByRole("heading", { name: VERSION_READ_DENIED_HEADING, exact: true })
+    .waitFor();
   // The policy reads are denied, so the sharing card is hidden instead of showing an error.
   await recipient.locator(".agent-access").waitFor({ state: "hidden" });
   assert.equal(
@@ -2424,13 +2463,15 @@ test("Agent sharing grants existing people exact discovery and native access, th
   const advice = await refreshedAdvice;
   assert.equal(advice.status(), 200);
   assert.equal((await advice.json()).data.operate, true);
-  await recipient.getByRole("heading", { name: "You cannot read this version" }).waitFor();
+  await recipient
+    .getByRole("heading", { name: VERSION_READ_DENIED_HEADING, exact: true })
+    .waitFor();
   await recipient.getByRole("button", { name: "Stop Agent", exact: true }).click();
   await recipient
     .getByRole("dialog")
     .getByRole("button", { name: "Stop Agent", exact: true })
     .click();
-  await recipient.getByText("Stop requested. OCC will not start", { exact: false }).waitFor();
+  await recipient.getByText(STOP_REQUESTED, { exact: true }).waitFor();
 
   // The stale administrator list holds the specific sharing binding, not the new operate grant.
   await panel.getByRole("button", { name: "Remove binding", exact: true }).click();
@@ -2699,8 +2740,11 @@ test("an Agent reader meets no refused read on Repositories, Policy denials or L
       "The version draft selects no repositories. The Agent runs without repository access.",
     )
     .waitFor();
-  await settle();
-  await expectNoText(page, /Repository choices are denied/);
+  await expectNoText(
+    page,
+    /repository choices for this Agent|Repository choices are not shown/,
+    settle,
+  );
   assert.equal(await page.getByRole("button", { name: "Retry repository choices" }).count(), 0);
   assert.equal(await page.getByRole("button", { name: "Save repository access" }).count(), 0);
 
@@ -2713,10 +2757,10 @@ test("an Agent reader meets no refused read on Repositories, Policy denials or L
     .waitFor();
   const noPolicyAccess = page.getByText(SANDBOX_POLICY_READ_DENIED);
   await noPolicyAccess.first().waitFor();
-  await settle();
   await expectNoText(
     page,
-    /Deploy an Agent to load Sandbox policy decisions|permission to read|Suggestions come from|No Driver configurations/,
+    /Deploy an Agent to load Sandbox policy decisions|include reading (?:this Agent’s policy|policy suggestions|this Agent’s Sandbox logs)|Suggestions come from|No Driver configurations/,
+    settle,
   );
   // The sentence names the suggestions too, so it is said once, on the network policy card: no
   // suggestions card repeats it (finding 2522).
@@ -2740,10 +2784,10 @@ test("an Agent reader meets no refused read on Repositories, Policy denials or L
       { exact: true },
     )
     .waitFor();
-  await settle();
   await expectNoText(
     page,
-    /permission to read|no such runtime log source|window: unavailable|Denials in the loaded window/,
+    /include reading (?:this Agent’s policy|policy suggestions|this Agent’s Sandbox logs)|no such runtime log source|window: unavailable|Denials in the loaded window/,
+    settle,
   );
   await sayOnce();
   // With no denial log, the window's controls could only show nothing; only the reason stays
@@ -4011,17 +4055,41 @@ test("explicit missing-file readback settles an uncertain workspace create witho
     (permission) => !(permission.action === "read" && permission.resourceKind === "agent"),
   );
   await reload.click();
-  await form.getByText("Access denied.", { exact: false }).waitFor();
+  // The API names the read grant its own denial checked (finding 2534).
+  await form
+    .getByText(new RegExp(`^${RegExp.escape(callerDenied("Agent read", `Agent ${agent.id}`))}`))
+    .waitFor();
   assert.equal(await save.isDisabled(), true);
   assert.equal(writeRequests().length, 1);
   administrator.permissions = permissions;
   unavailable = true;
   await reload.click();
-  await form.getByText("Workspace access is unavailable.", { exact: false }).waitFor();
+  await form.getByText(WORKSPACE_UNREACHABLE, { exact: false }).waitFor();
   assert.equal(await editor.isDisabled(), true);
   assert.equal(await save.isDisabled(), true);
   assert.equal(writeRequests().length, 1);
   unavailable = false;
+  // A rate limit says how long to wait instead of blaming the gateway (finding 2538).
+  await page.route(
+    fixture.origin + path,
+    (route) =>
+      route.request().method() === "GET"
+        ? route.fulfill({ ...proxyErrorResponse(429), headers: { "retry-after": "30" } })
+        : route.fallback(),
+    { times: 1 },
+  );
+  await reload.click();
+  await form.getByText(tooManyRequestsIn(30), { exact: false }).waitFor();
+  // A request that never reached the API says so, not that the gateway is down.
+  await page.route(
+    fixture.origin + path,
+    (route) => (route.request().method() === "GET" ? route.abort() : route.fallback()),
+    { times: 1 },
+  );
+  await reload.click();
+  await form.getByText(WORKSPACE_API_UNREACHABLE, { exact: true }).waitFor();
+  assert.equal(await save.isDisabled(), true);
+  assert.equal(writeRequests().length, 1);
   const reply = page.waitForResponse(
     (response) => response.url() === fixture.origin + path && response.request().method() === "GET",
   );
@@ -4055,7 +4123,7 @@ test("explicit missing-file readback settles an uncertain workspace create witho
   assert.equal(await save.isDisabled(), true);
   assert.equal(await readFile(join(root, "USER.md"), "utf8"), "# Deliberate replacement create\n");
   await reload.click();
-  await form.getByText("Workspace access is unavailable.", { exact: false }).waitFor();
+  await form.getByText(WORKSPACE_UNREACHABLE, { exact: false }).waitFor();
   assert.equal(await save.isDisabled(), true);
   await reload.click();
   await form.getByText("USER.md loaded.", { exact: true }).waitFor();
@@ -4177,16 +4245,15 @@ test("Secret summaries retain revision bindings and distinguish unreadable metad
   await page.screenshot({ path: join(artifacts, "bound-harness-revision.png"), fullPage: true });
   await page.getByRole("tab", { name: "Channels", exact: true }).click();
   await page.getByRole("link", { name: "Revision Slack app", exact: true }).waitFor();
-  const hiddenSecret = page.getByText(
-    `A Secret is bound. Its name is hidden because your access does not include reading it. ${askForGrant("Secret read on it")}`,
-    { exact: true },
-  );
+  // The readable Secret list leaves the bot token's Secret out, so it is not read: its refusal
+  // would be an audited denial (finding 2619).
+  const hiddenSecret = page.getByText(BOUND_SECRET_UNLISTED, { exact: true });
   await hiddenSecret.waitFor();
   assert.equal(await hiddenSecret.getAttribute("title"), bot.id);
   assert.equal(await page.getByRole("button", { name: /Configure Slack|Edit Slack/ }).count(), 0);
   await page.screenshot({ path: join(artifacts, "bound-channels-restricted.png"), fullPage: true });
   assert.equal(
-    requests.some((request) => request.path === `/namespaces/${namespace.id}/secrets`),
+    requests.some((request) => request.path === `/namespaces/${namespace.id}/secrets/${bot.id}`),
     false,
   );
   assert.deepEqual(nonAuthWriteRequests(requests), []);
@@ -4197,7 +4264,8 @@ test("Secret summaries retain revision bindings and distinguish unreadable metad
   const secretPath = `/namespaces/${namespace.id}/secrets/${app.id}`;
   assert.equal((await fixture.request("DELETE", secretPath)).status, 409);
   // Admit and select the replacement draft, leaving the viewed revision historical.
-  // With no live references, a real deletion makes its bound metadata unavailable.
+  // With no live references, a real deletion makes its bound metadata unavailable. The readable
+  // list leaves a deleted Secret out too, so the summary says either may be why.
   await fixture.seedActiveAgentRevision(namespace.id, agent.id, active.revision.id);
   const deleted = await fixture.rawRequest("DELETE", secretPath, {
     headers: authenticatedHeaders(await fixture.signIn()),
@@ -4206,7 +4274,8 @@ test("Secret summaries retain revision bindings and distinguish unreadable metad
   assert.equal((await fixture.request("GET", secretPath)).status, 404);
   await page.reload();
   await page
-    .getByText(`Bound Secret · ${app.id} · Metadata unavailable`, { exact: true })
+    .locator(`.secret-reference[title="${app.id}"]`)
+    .filter({ hasText: BOUND_SECRET_UNLISTED })
     .waitFor();
   await page.getByRole("button", { name: "Open version draft", exact: true }).last().click();
   await page.getByRole("tab", { name: "Channels", exact: true }).click();
@@ -4750,9 +4819,7 @@ test("Console can repeat Stop without treating the selected version as cleanup c
     unit.agents.compareAndClearActiveRevision(namespace.id, agent.id, active.revision.id),
   );
   await page.getByRole("button", { name: "Refresh stop status" }).click();
-  await page
-    .getByText("No version is selected. Deploy a new version to start this Agent.")
-    .waitFor();
+  await page.getByText(STOPPED_NO_VERSION).waitFor();
   await waitForEnabled(repeat);
   assert.equal(agentStopRequests(requests, namespace.id, agent.id).length, 1);
   await repeat.click();

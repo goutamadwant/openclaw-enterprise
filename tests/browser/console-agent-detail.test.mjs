@@ -11,6 +11,7 @@ import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs
 import { createTestSecretDriver } from "../helpers/secret-driver.mjs";
 import {
   accessBindingPostRequests,
+  accessibleDescription,
   AGENT_READ,
   apiRequests,
   deniedCreateSecretOption,
@@ -68,13 +69,16 @@ import {
   waitForLiveControls,
 } from "./console-agents-test-support.mjs";
 import {
+  AGENT_DEPLOY_NOT_INCLUDED,
   AGENT_SAVE_DENIED,
   AGENT_SOURCES_DENIED,
   askForGrant,
   callerDenied,
   CONFIGURATION_EDITS_PENDING,
   CONFIGURATION_UPDATE_DENIED,
+  CONSOLE_NAMESPACE_NOT_READY,
   CONFIGURATION_SAVE_DENIED,
+  GENERIC_DENIAL,
   NAMESPACE_NOT_READY,
   NEW_SECRET_OPERATE_DENIED,
   NEW_SECRET_OPERATE_REMEDY,
@@ -84,9 +88,21 @@ import {
   SECRET_CREATE_DENIED,
   SECRET_NAME_CONFLICT,
   SECRET_OPERATE_DENIED,
+  STOP_CONFIRMATION,
+  STOP_REQUESTED,
+  STOP_RUNNING_VERSION,
+  STOP_STATUS_REFRESH_FAILED,
+  STOPPED_NO_VERSION,
   WORKSPACE_FILES_UNAVAILABLE,
+  credentialCheckedAtDeploy,
   namespaceListDenied,
+  notIncluded,
   secretOperateRefused,
+  stopRefused,
+  stopStatusRefreshFailed,
+  NO_TEST_REQUEST,
+  PLUGINS_READ_ONLY,
+  READ_ONLY_DRAFT_NOTICE,
 } from "../helpers/refusal-text.mjs";
 
 test("Agent detail separates the current version, viewed version, and latest deployment", async (t) => {
@@ -151,7 +167,7 @@ test("Agent detail separates the current version, viewed version, and latest dep
   await overview.nth(1).getByText("v2 · Queued").waitFor();
   await overview.nth(2).getByText("Not verified").waitFor();
   // A running version's unverified serving says why (finding 2367).
-  await overview.nth(2).getByText("OCC sends no test request.", { exact: true }).waitFor();
+  await overview.nth(2).getByText(NO_TEST_REQUEST, { exact: true }).waitFor();
   const activity = await expectDeploymentOutcome(page, "Queued");
   await activity.getByText("Most recent visible deployment · v2").waitFor();
   await activity.getByText("Waiting for a worker claim.").waitFor();
@@ -995,7 +1011,14 @@ test("Gateway password access saves the generated reference without changing adm
       `Gateway password access is enabled in the saved Configuration and included in v${freshV1.revision.revision}.`,
     )
     .waitFor();
-  assert.equal(await page.getByText(/Deploy a new version to apply it/).count(), 0);
+  assert.equal(
+    await page
+      .getByText(
+        "Gateway password access is enabled in the saved Configuration. Deploy a new version to apply it.",
+      )
+      .count(),
+    0,
+  );
 });
 
 test("Agent detail preserves admitted revision history while draft edits change current configuration", async (t) => {
@@ -1073,6 +1096,23 @@ test("Agent detail preserves admitted revision history while draft edits change 
   );
   assertRevisionUrl(page, "draft");
 
+  const deploy = page.getByRole("button", { name: "Deploy new version" });
+  assert.equal(await deploy.isEnabled(), true);
+  const savingMode = await holdRequests(
+    t,
+    page,
+    `${fixture.origin}/namespaces/${namespace.id}/agents/${agent.id}`,
+    {
+      method: "PATCH",
+      once: true,
+    },
+  );
+  await page.getByRole("button", { name: "Turn off managed mode for next deployment" }).click();
+  await savingMode.requested;
+  assert.equal(await deploy.isDisabled(), true);
+  savingMode.release();
+  await page.getByRole("button", { name: "Turn on managed mode for next deployment" }).waitFor();
+
   await page.getByRole("button", { name: "Edit Configuration" }).click();
   await openAdvancedSettings(page);
   const editor = page.getByLabel("Configuration JSON");
@@ -1133,6 +1173,10 @@ test("Agent detail preserves admitted revision history while draft edits change 
   await page.getByRole("tab", { name: "Configuration", exact: true }).click();
   assert.deepEqual(JSON.parse(await editor.inputValue()), editedValues);
   await page.getByLabel("Available versions").selectOption(second.revision.id);
+  const requestedMode = page.locator(".configuration-summary dt", {
+    hasText: "Requested Gateway managed mode",
+  });
+  assert.equal(await requestedMode.locator("xpath=following-sibling::dd[1]").textContent(), "On");
   await page.getByRole("button", { name: "Edit current Configuration" }).click();
   await waitForLiveControls(page, ["configuration-json"]);
   assert.deepEqual(JSON.parse(await editor.inputValue()), editedValues);
@@ -1225,6 +1269,19 @@ test("Agent detail preserves admitted revision history while draft edits change 
   await editor.fill(JSON.stringify(nativeValues("after-cancel")));
   await page.getByRole("button", { name: "Save Configuration" }).click();
   await page.getByText(/generation 7/).waitFor();
+
+  // Saving an Agent setting preserves both an unsaved editor and a concurrent reassignment.
+  await page.getByRole("button", { name: "Edit Configuration" }).click();
+  const unsaved = JSON.stringify(nativeValues("unsaved"));
+  await editor.fill(unsaved);
+  const reassigned = await fixture.createConfiguration(namespace.id, nativeValues("reassigned"));
+  await fixture.updateAgent(namespace.id, agent.id, { configurationId: reassigned.id });
+  await page.getByRole("button", { name: "Turn on managed mode for next deployment" }).click();
+  await page.getByRole("button", { name: "Turn off managed mode for next deployment" }).waitFor();
+  assert.equal(await editor.inputValue(), unsaved);
+  const savedAgent = await fixture.request("GET", `/namespaces/${namespace.id}/agents/${agent.id}`);
+  assert.equal(savedAgent.data.gatewayManagedMode, true);
+  assert.equal(savedAgent.data.configurationId, reassigned.id);
 });
 
 test("Agent detail saves plugin changes for the next revision without changing admitted revisions", async (t) => {
@@ -1977,11 +2034,10 @@ test("Agent credentials choose existing Secrets for harness authentication", asy
   assert.equal(await unreadableSecret.inputValue(), "Bound Secret");
   await unreadableSecret.click();
   await page.getByRole("option", { name: "Bound Secret", exact: true }).waitFor();
+  // A Secret no list read shows gets no metadata link (finding D757).
   assert.equal(
-    await page
-      .getByRole("link", { name: /View harness authentication Secret metadata/ })
-      .getAttribute("href"),
-    `/namespaces/${namespace.id}/secrets/${replacementSecret.id}`,
+    await page.getByRole("link", { name: /View harness authentication Secret metadata/ }).count(),
+    0,
   );
 });
 
@@ -2478,7 +2534,7 @@ test("Agent credential Secret picker searches, validates, and preserves duplicat
   await page.route(`**/namespaces/${namespace.id}/secrets`, failSecretCreate);
   await dialog.getByLabel("Name", { exact: true }).fill("Namespace not ready picker Secret");
   await dialog.getByRole("button", { name: "Create Secret", exact: true }).click();
-  await dialog.getByRole("alert").filter({ hasText: "cannot store Secrets yet" }).waitFor();
+  await dialog.getByRole("alert").filter({ hasText: CONSOLE_NAMESPACE_NOT_READY }).waitFor();
   assert.equal(
     await dialog.getByLabel("Name", { exact: true }).inputValue(),
     "Namespace not ready picker Secret",
@@ -2539,11 +2595,8 @@ const HARNESS_GRANT_REFUSED =
 // An Installation administrator's console read the IAM policy and found no grant (finding 2260).
 const HARNESS_GRANT_MISSING =
   "This Agent has no access to its authentication Secret, so deploying it would be refused. Select Save authentication source to grant it.";
-const HARNESS_GRANT_UNVERIFIED =
-  "Authentication source saved, but this session did not verify that this Agent can use the selected Secret. Granting access needs Installation administration access: ask an Installation administrator to open this Agent's Credentials and select Save authentication source.";
-
-// Matches a fixed sentence inside a pattern that also matches a random request ID.
-const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// A member's save sends no grant: the deploy checks the Agent's access (finding D748).
+const HARNESS_SAVED_FOR_MEMBER = `Authentication source saved. ${credentialCheckedAtDeploy("Secret")}`;
 
 test("Agent credentials report partial harness Secret grant failure", async (t) => {
   const fixture = await createConsoleAppFixture(t);
@@ -2627,7 +2680,7 @@ test("Agent credentials report partial harness Secret grant failure", async (t) 
   await page
     .getByText(
       new RegExp(
-        `^${escapeRegExp(`Authentication source saved, but this Agent could not be read before retrying its credential access. ${callerDenied("Agent read", `Agent ${agent.id}`)}`)} Request ID: req_[0-9a-f-]{36} Select Retry credential access once the Agent can be read\\.$`,
+        `^${RegExp.escape(`Authentication source saved, but this Agent could not be read before retrying its credential access. ${callerDenied("Agent read", `Agent ${agent.id}`)}`)} Request ID: req_[0-9a-f-]{36} Select Retry credential access once the Agent can be read\\.$`,
       ),
     )
     .waitFor();
@@ -2664,10 +2717,10 @@ test("Agent credentials report partial harness Secret grant failure", async (t) 
 });
 
 // Granting the Agent its authentication Secret writes IAM policy, which needs Installation
-// administration. A member's save sends no IAM request, so it says this session did not verify
-// the Agent's access, whether or not an administrator already granted it. It names who finishes
-// the grant and how, and offers no Retry the API would refuse. The named step grants it.
-test("Agent credentials name the administrator step for a member's harness Secret grant", async (t) => {
+// administration. A member's save sends no IAM request, whether or not an administrator already
+// granted it. The card settles to one saved state that says the deploy checks the Agent's access
+// and who gives it, and stays editable (finding D748). An administrator's save grants it.
+test("Agent credentials settle a member's harness Secret save and say who grants access", async (t) => {
   const fixture = await createConsoleAppFixture(t);
   await fixture.bootstrap();
   const namespace = await fixture.createNamespace("Member harness grant", { ready: true });
@@ -2676,6 +2729,7 @@ test("Agent credentials name the administrator step for a member's harness Secre
     "Member harness Secret",
     "hidden-member-harness",
   );
+  const otherSecret = await fixture.createSecret(namespace.id, "Other member Secret", "hidden");
   const ungranted = await fixture.createAgent(
     namespace.id,
     "Member Harness Agent",
@@ -2694,21 +2748,21 @@ test("Agent credentials name the administrator step for a member's harness Secre
     const url = detailUrl(fixture, namespace.id, agent.id, "draft", "credentials");
     const { page } = await newPage(t, fixture);
     const requests = apiRequests(page, fixture.origin);
-    const probe = page.waitForResponse(`${fixture.origin}/observability`);
     await login(page, fixture, url, writer.credentials);
     await page.getByRole("heading", { name: agent.name }).waitFor();
-    // The session's Installation read already found this account is no administrator.
-    assert.equal((await probe).status(), 403);
+    // The Namespace permission answer already said this account is no administrator, so the
+    // session sends no probe.
+    assert.deepEqual(
+      requests.filter(({ path }) => path === "/observability"),
+      [],
+    );
     await selectSecret(page, "API key Secret", replacementSecret);
-    await page.getByRole("button", { name: "Save authentication source" }).click();
-    const warning = page.getByRole("alert").filter({ hasText: HARNESS_GRANT_UNVERIFIED });
-    await warning.waitFor();
-    assert.equal(await warning.textContent(), HARNESS_GRANT_UNVERIFIED);
-    assert.deepEqual(await statusTone(warning), {
-      className: "status",
-      tone: "warning",
-      role: "alert",
-    });
+    const save = page.getByRole("button", { name: "Save authentication source" });
+    await save.click();
+    const notice = page.getByRole("status").filter({ hasText: HARNESS_SAVED_FOR_MEMBER });
+    await notice.waitFor();
+    assert.equal(await notice.textContent(), HARNESS_SAVED_FOR_MEMBER);
+    assert.deepEqual(await statusTone(notice), { className: "hint", tone: null, role: "status" });
     // The Agent saved its new source; no IAM request went out that the API would refuse and
     // audit.
     const saved = await fixture.request("GET", `/namespaces/${namespace.id}/agents/${agent.id}`);
@@ -2717,21 +2771,28 @@ test("Agent credentials name the administrator step for a member's harness Secre
       requests.filter(({ path }) => path.includes("/iam/")),
       [],
     );
-    // No dead Retry: only Reload remains. The save finished and nothing this member can do
-    // confirms the grant, so Deploy is not held: the API checks the Agent's access when it
-    // deploys (finding 2547).
+    // No dead Retry, and the card stays editable: the save finished and nothing this member
+    // can do confirms the grant, so Deploy is not held either: the API checks the Agent's access
+    // when it deploys (findings 2547, D748).
     assert.equal(await page.getByRole("button", { name: "Retry credential access" }).count(), 0);
-    assert.equal(await page.getByRole("button", { name: "Save authentication source" }).count(), 0);
+    await waitForEnabled(save);
     await waitForEnabled(page.getByRole("button", { name: "Reload authentication source" }));
+    await waitForEnabled(page.locator("#harness-auth-method"));
+    await waitForEnabled(page.getByLabel("API key Secret", { exact: true }));
     const deploy = page.getByRole("button", { name: "Deploy new version" });
-    await waitForEnabled(deploy);
-    await expectNoText(page, "Confirm authentication and Secret access in Credentials");
-    // The rebuilt tab keeps the same words, still offers no Retry and still holds nothing.
+    await expectNoText(page, "Confirm authentication and Secret access in Credentials", () =>
+      waitForEnabled(deploy),
+    );
+    // The rebuilt tab still offers no Retry, still holds nothing and stays editable.
     await page.getByRole("tab", { name: "Configuration", exact: true }).click();
     await page.getByRole("tab", { name: "Credentials", exact: true }).click();
-    await page.getByRole("alert").filter({ hasText: HARNESS_GRANT_UNVERIFIED }).waitFor();
+    await waitForEnabled(save);
     assert.equal(await page.getByRole("button", { name: "Retry credential access" }).count(), 0);
     assert.equal(await deploy.isDisabled(), false);
+    // Another selection is staged, and the card says only that, not "saved" beside it.
+    await selectSecret(page, "API key Secret", otherSecret);
+    await page.getByText("Secret binding staged. Save changes to apply it.").waitFor();
+    assert.equal(await page.getByText(HARNESS_SAVED_FOR_MEMBER).count(), 0);
   }
 
   // The administrator the warning names opens the Agent's Credentials: its IAM policy read finds
@@ -3030,16 +3091,7 @@ test("Agent stop confirmation uses the real API, preserves Agent state, and depl
     .waitFor();
   // The dialog names its target Agent as text, and in its accessible description.
   await dialog.getByText("Stop Candidate", { exact: true }).waitFor();
-  assert.match(
-    await dialog.evaluate((node) =>
-      node
-        .getAttribute("aria-describedby")
-        .split(" ")
-        .map((id) => node.ownerDocument.getElementById(id)?.textContent)
-        .join(" "),
-    ),
-    /^Agent: Stop Candidate This interrupts the current runtime gateway/,
-  );
+  assert.equal(await accessibleDescription(dialog), `Agent: Stop Candidate ${STOP_CONFIRMATION}`);
   await dialog.getByRole("button", { name: "Cancel" }).click();
   await dialog.waitFor({ state: "hidden" });
   assert.equal(agentStopRequests(requests, namespace.id, agent.id).length, 0);
@@ -3061,7 +3113,7 @@ test("Agent stop confirmation uses the real API, preserves Agent state, and depl
   assert.equal(stoppedBody.data.activeRevisionId, active.revision.id);
 
   await page.getByRole("status").getByText("Stop requested.").waitFor();
-  await page.getByText(/Runtime shutdown completion is not exposed in Console/).waitFor();
+  await page.getByText(STOP_REQUESTED, { exact: true }).waitFor();
   // The card names the version as the page does, and the overview reports the request
   // (finding 1899).
   const stopRegion = page.getByRole("region", { name: "Stop Agent", exact: true });
@@ -3125,9 +3177,23 @@ test("Agent stop confirmation uses the real API, preserves Agent state, and depl
     .getByRole("region", { name: "Stop Agent", exact: true })
     .getByText("No current version", { exact: true })
     .waitFor();
-  await page
-    .getByText("No version is selected. Deploy a new version to start this Agent.")
-    .waitFor();
+  await page.getByText(STOPPED_NO_VERSION).waitFor();
+  // A completed stop also clears the selected version, but no deployment is in progress: a new
+  // stop intent must not say it cancels one, nor report one cancelled (finding D691).
+  await page.getByRole("button", { name: "Request Stop again", exact: true }).click();
+  dialog = page.getByRole("dialog", { name: "Stop this Agent?" });
+  await dialog.getByText(STOP_CONFIRMATION, { exact: true }).waitFor();
+  assert.equal(await dialog.getByText(/deployment in progress/).count(), 0);
+  const repeated = page.waitForResponse(
+    (response) =>
+      response.url() === `${fixture.origin}/namespaces/${namespace.id}/agents/${agent.id}/stop` &&
+      response.request().method() === "POST",
+  );
+  await dialog.getByRole("button", { name: "Stop Agent" }).click();
+  assert.equal((await repeated).status(), 202);
+  await dialog.waitFor({ state: "hidden" });
+  await page.getByText(STOPPED_NO_VERSION).waitFor();
+  assert.equal(await page.getByText(/deployment in progress is cancelled/).count(), 0);
 
   await page.getByRole("tab", { name: "Configuration", exact: true }).click();
   await page.getByRole("button", { name: "Create new version", exact: true }).last().click();
@@ -3329,8 +3395,8 @@ test("Agent detail has no Stop row for an Agent that was never deployed", async 
     ["Delete Agent"],
   );
 
-  // The first deploy creates a version and requests the Agent running, so Stop returns.
-  const revision = await fixture.deployAgent(namespace.id, agent.id);
+  // Once a deployed version is selected for service, something runs, so Stop returns.
+  const { revision } = await fixture.seedActiveAgentRevision(namespace.id, agent.id);
   await page.goto(detailUrl(fixture, namespace.id, agent.id, revision.id, "configuration").href);
   await page.getByRole("heading", { name: "Version v1" }).waitFor();
   await stopRegion.getByRole("button", { name: "Stop Agent", exact: true }).waitFor();
@@ -3440,7 +3506,22 @@ test("Agent stop uncertainty requires refresh before another stop request", asyn
     { times: 1 },
   );
   await page.getByRole("button", { name: "Refresh stop status" }).click();
-  await page.getByText("Could not refresh stop status.").waitFor();
+  await page.getByText(STOP_STATUS_REFRESH_FAILED).waitFor();
+  assert.deepEqual(await stopControls.allTextContents(), ["Refresh stop status"]);
+
+  // A refused status read names the Agent read it checks, not a bare denial (finding 2538).
+  await page.route(
+    fixture.origin + agentPath,
+    (route) => route.fulfill(apiErrorResponse(403, "FORBIDDEN", GENERIC_DENIAL)),
+    { times: 1 },
+  );
+  await page.getByRole("button", { name: "Refresh stop status" }).click();
+  await page
+    .getByText(
+      stopStatusRefreshFailed(notIncluded("reading this Agent's status", "Agent read on it")),
+      { exact: true },
+    )
+    .waitFor();
   assert.deepEqual(await stopControls.allTextContents(), ["Refresh stop status"]);
 
   // Even this Agent's active status cannot tell us whether it is requested to run or stop.
@@ -3601,7 +3682,7 @@ test("Agent stop denial keeps the Agent running with permission feedback", async
     .click();
   assert.equal((await denied).status(), 403);
 
-  await page.getByText("You do not have permission to stop this Agent").waitFor();
+  await page.getByText(stopRefused("this Agent")).waitFor();
   assert.equal(agentStopRequests(requests, namespace.id, agent.id).length, 1);
   await waitForEnabled(page.getByRole("button", { name: "Stop Agent" }));
   const current = await fixture.request("GET", `/namespaces/${namespace.id}/agents/${agent.id}`);
@@ -3649,8 +3730,12 @@ test("a read-only principal sees Agent mutation controls disabled or absent befo
 
   const draft = detailUrl(fixture, namespace.id, agent.id, "draft", "configuration");
   await page.goto(draft.href);
-  await page.getByText("Your access does not include deploying this Agent.").waitFor();
+  await page.getByText(AGENT_DEPLOY_NOT_INCLUDED, { exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: "Deploy new version" }).isDisabled(), true);
+  assert.equal(
+    await page.getByRole("button", { name: "Turn off managed mode for next deployment" }).count(),
+    0,
+  );
 
   // The summary is a probe, not an attempted operation: no write was sent and nothing was
   // audited as a denial for the summary or the gated operations.
@@ -3726,7 +3811,7 @@ for (const viewport of [
     const rows = [
       {
         name: "Stop Agent",
-        sentence: "Stops the running version. The Agent stays and can be deployed again.",
+        sentence: STOP_RUNNING_VERSION,
         dialog: "Stop this Agent?",
         confirm: "Stop Agent",
         prose: /Configuration, versions, Credentials, and workspace data are retained\./,
@@ -4014,6 +4099,7 @@ test("a version editor without Agent update can recover a failed deployment from
     configurationSecretsOperateDeniedBindings: [],
     agentSourcesOperate: false,
     sandboxPolicyRead: false,
+    readLogs: false,
   });
 
   // The header label confirms the page applied the permission answer before recovery is used.
@@ -4108,10 +4194,6 @@ const SOCKET_SLACK = {
   allowFrom: ["U123"],
   channels: { C123: { requireMention: true } },
 };
-const READ_ONLY_DRAFT_NOTICE =
-  "Version draft · read-only with your access. The next deployment uses it as saved.";
-const PLUGINS_READ_ONLY =
-  "These are the version draft's plugin selections, read-only with your access. The next deployment uses them as saved.";
 
 // A member who can only read the Agent views its draft: the saved JSON with no editor whose
 // Save answers 403, and no editor's copy or checklist (finding 2421).
@@ -4144,6 +4226,7 @@ test("a reader without update views the version draft read-only", async (t) => {
     configurationSecretsOperateDeniedBindings: [],
     agentSourcesOperate: false,
     sandboxPolicyRead: false,
+    readLogs: false,
   });
   await page.getByText(CONFIGURATION_READ_ONLY, { exact: true }).waitFor();
   await page.getByText("View native Configuration", { exact: true }).waitFor();
@@ -4161,7 +4244,7 @@ test("a reader without update views the version draft read-only", async (t) => {
     await page.getByText("Edit and save Configuration, plugins, or Channels").isVisible(),
     false,
   );
-  await page.getByText("Your access does not include deploying this Agent.").waitFor();
+  await page.getByText(AGENT_DEPLOY_NOT_INCLUDED, { exact: true }).waitFor();
   const entry = page.getByRole("button", { name: "View version draft", exact: true });
   await entry.getByText("Read-only Configuration", { exact: true }).waitFor();
 
@@ -4287,6 +4370,7 @@ test("an Agent editor without Configuration update sees the Configuration read-o
     configurationSecretsOperateDeniedBindings: [],
     agentSourcesOperate: true,
     sandboxPolicyRead: false,
+    readLogs: false,
   });
   await page.getByText(CONFIGURATION_READ_ONLY, { exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: "Edit Configuration" }).count(), 0);
@@ -4358,6 +4442,7 @@ test("an editor without operate on a bound Secret views the version draft read-o
     configurationSecretsOperateDeniedBindings: ["EXTERNAL_API_TOKEN"],
     agentSourcesOperate: false,
     sandboxPolicyRead: false,
+    readLogs: false,
   });
   await page.getByText(READ_ONLY_DRAFT_NOTICE, { exact: true }).waitFor();
   assert.equal(await page.getByText(/New version\. Changes affect/).count(), 0);
@@ -4395,9 +4480,13 @@ test("a deployer without update keeps the draft checklist", async (t) => {
     nativeValues("slack", { harnessId: "codex", channels: { slack: SOCKET_SLACK } }),
     { executionMode: "dedicated" },
   );
+  // Read and operate on the model credential Secret, so Deploy waits on the draft, not on a
+  // Secret this member cannot read (finding D756).
   const deployer = await fixture.createNamespaceMember("draft-deployer", namespace.id, [
     ...AGENT_READ,
     ["deploy", "agent"],
+    ["read", "secret"],
+    ["operate", "secret"],
   ]);
   const path = "/namespaces/" + namespace.id + "/agents/" + agent.id;
   const { page } = await newPage(t, fixture);
@@ -4469,7 +4558,7 @@ test("a late permission answer turns a reader's Channels and Channel Secrets rea
   await page
     .getByRole("button", { name: "Set up credentials", exact: true })
     .waitFor({ state: "hidden" });
-  await page.getByText("Your access does not include deploying this Agent.").waitFor();
+  await page.getByText(AGENT_DEPLOY_NOT_INCLUDED, { exact: true }).waitFor();
 
   // The Channel Secrets panel was built before the answer, with enabled pickers.
   await page.getByRole("tab", { name: "Credentials", exact: true }).click();
@@ -4701,40 +4790,6 @@ test("a channel Secrets save may replace a bound Secret the member cannot operat
   assert.equal((await drawerSaving).status(), 200);
 });
 
-// The Channels drawer saves the same bindings. While the administrator's bot token Secret stays
-// bound, its save is refused before any request; replacing it saves (finding 2444).
-test("the Channels drawer save must replace a bound Secret the member cannot operate", async (t) => {
-  const { fixture, namespace, agent, member, app, own, configurationPath } =
-    await replaceSecretFixture(t, "Replaced drawer editor");
-  const { page } = await newPage(t, fixture);
-  const requests = apiRequests(page, fixture.origin);
-  await login(
-    page,
-    fixture,
-    detailUrl(fixture, namespace.id, agent.id, "draft", "channels"),
-    member.credentials,
-  );
-  await page.getByRole("button", { name: "Edit Slack" }).click();
-  const dialog = page.getByRole("dialog", { name: "Edit Slack" });
-  await dialog.getByText(REPLACE_BOT_TOKEN, { exact: false }).waitFor();
-  // A channel setting alone keeps the administrator's Secret bound: refused up front.
-  await dialog.getByLabel("Require a mention").setChecked(false);
-  requests.length = 0;
-  await dialog.getByRole("button", { name: "Save configuration" }).click();
-  await dialog.getByText(KEEPS_BOT_TOKEN, { exact: true }).waitFor();
-  assert.deepEqual(nonAuthWriteRequests(requests), []);
-  // With the member's own Secret for the bot token the same save goes through.
-  await selectSecret(dialog, "Slack bot token", own);
-  const saving = page.waitForResponse(
-    (r) => r.request().method() === "PATCH" && r.url().endsWith(configurationPath),
-  );
-  await dialog.getByRole("button", { name: "Save configuration" }).click();
-  assert.equal((await saving).status(), 200);
-  const saved = await fixture.request("GET", configurationPath);
-  assert.equal(saved.data.secretBindings.SLACK_BOT_TOKEN.source.id, own.id);
-  assert.equal(saved.data.secretBindings.SLACK_APP_TOKEN.source.id, app.id);
-});
-
 // Binding a Secret needs Secret operate on it. A Configuration editor with operate on only the
 // two bound Slack Secrets was offered a third readable Secret, saw it staged, and met a 403 that
 // asked for the Configuration update they had (finding 2453, D710). Each Secret field now lists
@@ -4790,7 +4845,10 @@ test("Secret fields refuse a readable Secret the editor cannot operate", async (
   const save = page.getByRole("button", { name: "Save channel Secrets" });
   await waitForEnabled(page.getByLabel("Slack bot token", { exact: true }));
   const denied = await operateDeniedSecretOption(page, "Slack bot token", spare);
-  assert.deepEqual((await (await answer).json()).data, { operateDenied: [spare.id] });
+  assert.deepEqual((await (await answer).json()).data, {
+    operateDenied: [spare.id],
+    unreadableOperateDenied: 0,
+  });
   // A forced click skips the disabled check: choosing it still stages nothing.
   await denied.click({ force: true });
   await page.getByLabel("Slack bot token", { exact: true }).press("Enter");
@@ -5127,6 +5185,7 @@ test("a negative permission answer reaching an open Stop or Delete dialog preven
           configurationSecretsOperateDeniedBindings: [],
           agentSourcesOperate: false,
           sandboxPolicyRead: false,
+          readLogs: false,
         },
       },
     );
@@ -5287,12 +5346,12 @@ test("a Plugins tab shown before the reread answers becomes editable when it lan
 
 // Disable Slack saves no bindings, so it keeps the administrator's bot token Secret bound and the
 // API would refuse it. The card offers it disabled, naming the binding to rebind first; after Edit
-// Slack rebinds it, Disable saves (finding 2471).
-test("Disable Slack waits until the replace persona rebinds the denied Secret", async (t) => {
-  const { fixture, namespace, agent, member, own, configurationPath } = await replaceSecretFixture(
-    t,
-    "Replaced disable editor",
-  );
+// Slack rebinds it, Disable saves (finding 2471). The Channels drawer saves the same bindings:
+// while the administrator's bot token Secret stays bound, its save is refused before any request;
+// replacing it saves (finding 2444).
+test("the Channels drawer and Disable Slack wait until the replace persona rebinds the denied Secret", async (t) => {
+  const { fixture, namespace, agent, member, app, own, configurationPath } =
+    await replaceSecretFixture(t, "Replaced disable editor");
   const { page } = await newPage(t, fixture);
   const requests = apiRequests(page, fixture.origin);
   await login(
@@ -5308,12 +5367,23 @@ test("Disable Slack waits until the replace persona rebinds the denied Secret", 
 
   await page.getByRole("button", { name: "Edit Slack" }).click();
   const dialog = page.getByRole("dialog", { name: "Edit Slack" });
+  await dialog.getByText(REPLACE_BOT_TOKEN, { exact: false }).waitFor();
+  // A channel setting alone keeps the administrator's Secret bound: refused up front.
+  await dialog.getByLabel("Require a mention").setChecked(false);
+  requests.length = 0;
+  await dialog.getByRole("button", { name: "Save configuration" }).click();
+  await dialog.getByText(KEEPS_BOT_TOKEN, { exact: true }).waitFor();
+  assert.deepEqual(nonAuthWriteRequests(requests), []);
+  // With the member's own Secret for the bot token the same save goes through.
   await selectSecret(dialog, "Slack bot token", own);
   const rebinding = page.waitForResponse(
     (r) => r.request().method() === "PATCH" && r.url().endsWith(configurationPath),
   );
   await dialog.getByRole("button", { name: "Save configuration" }).click();
   assert.equal((await rebinding).status(), 200);
+  const rebound = await fixture.request("GET", configurationPath);
+  assert.equal(rebound.data.secretBindings.SLACK_BOT_TOKEN.source.id, own.id);
+  assert.equal(rebound.data.secretBindings.SLACK_APP_TOKEN.source.id, app.id);
   await expectNoText(page, DISABLE_KEEPS_BOT_TOKEN, () => waitForEnabled(disable));
   const disabling = page.waitForResponse(
     (r) => r.request().method() === "PATCH" && r.url().endsWith(configurationPath),

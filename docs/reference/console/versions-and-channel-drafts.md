@@ -58,8 +58,8 @@ history, repeat the startup model probe, or prove message delivery.
 `secret:operate` access for the Agent principal on an API-key or Service Accounts
 Secret. Grant changes require Installation `administer`; issued ChatGPT accounts
 and operator-managed authentication skip the grant. A member's save sends no
-grant, reports that access was not verified, and names the Installation
-administrator. Opening Credentials as an administrator reads Namespace IAM and blocks
+grant: the form stays editable and says that deploying checks the Agent's access
+and that an Installation administrator gives it. Opening Credentials as an administrator reads Namespace IAM and blocks
 deployment while that grant is missing. A refused or failed grant request offers **Retry credential access**
 without repeating the Agent update. Partial saves survive navigation. Grants do not prove runtime or
 provider readiness.
@@ -67,7 +67,10 @@ provider readiness.
 Configuration and Slack summaries show bound Secret names and IDs for the viewed
 draft or version. Names require exact same-Namespace Secret `read`; a denied
 read says a Secret is bound and its name is hidden, with the ID in the tooltip, and
-missing or failed reads show the ID with **Metadata unavailable**. **No Secret
+missing or failed reads show the ID with **Metadata unavailable**. For a caller
+who is not an Installation administrator, a Secret that the readable Secret list
+leaves out is not read: it shows as unavailable, because the caller cannot read
+it or it was deleted, with the ID in the tooltip. **No Secret
 bound** means no binding. Values are never read, and metadata does not prove
 credential validity.
 
