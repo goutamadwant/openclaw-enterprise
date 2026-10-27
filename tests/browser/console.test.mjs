@@ -2781,6 +2781,7 @@ test("native recovery remains usable with exact Agent administer and no Namespac
     publicOrigin: true,
     authCookieDomain: cookieDomain,
     development: { enabled: false },
+    agentGatewayManagedMode: false,
     https: true,
     authSecureCookies: true,
     nativeAdmin: { enabled: true, domain: nativeDomain, sharedCookieDomain: cookieDomain },
