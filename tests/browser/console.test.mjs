@@ -2879,7 +2879,7 @@ test("native recovery remains usable with exact Agent administer and no Namespac
     await page.getByRole("button", { name: "Sign in" }).click();
 
     await page.getByRole("heading", { name: "Native admin UI" }).waitFor();
-    const launch = page.getByRole("link", { name: "Open admin console", exact: true });
+    const launch = page.getByRole("link", { name: "Open Agent UI", exact: true });
     await launch.waitFor();
     assert.equal(await launch.getAttribute("href"), native.data.url);
     assert.equal(await page.getByText("Namespace unavailable", { exact: true }).count(), 0);

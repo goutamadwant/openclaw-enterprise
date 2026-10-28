@@ -164,10 +164,10 @@ Driver did not observe, for example after a controller restart. If the stop
 fails, the Driver still removes the container and reports the stop failure.
 
 State on that volume outlives runtime image upgrades. Before OpenClaw starts,
-the gateway runs the same agent database migration as a
+the gateway runs the same state migration as a
 [Kubernetes Gateway](kubernetes-compute/storage-and-credentials.md#gateway-storage):
 `openclaw doctor --fix --non-interactive` once, with the configuration
-read-only, when an agent database uses an older schema. If a database is still
+read-only, when its shared state or an agent database uses an older schema. If a database is still
 older afterwards, the container logs `Gateway state migration failed` and exits
 without starting OpenClaw, and the deployment fails as an unready container.
 The Driver then removes the container, so Doctor's output survives only
@@ -187,8 +187,10 @@ published port cannot reach while the healthcheck on loopback passes: a
 
 The container implementation renders `gateway.auth.mode: password` when native
 Configuration omits the mode. Explicit `password` and `trusted-proxy` are supported.
-Only supported authentication fields and modes are admitted. These rules do not
-remove the harness-authentication admission limit above.
+Only supported authentication fields and modes are admitted: deployment refuses
+another mode, such as `token` or `none`, or an unsupported field, such as
+`gateway.auth.token`, with `409` before it stops the running revision. These rules
+do not remove the harness-authentication admission limit above.
 
 With password mode, omitting `gateway.auth.password` selects the managed
 `OPENCLAW_GATEWAY_PASSWORD` reference. An explicit reference to that variable also

@@ -2243,6 +2243,7 @@ async function loadPage({
         undefined,
         { showDenied: true },
       );
+      nativeAdmin.section.prepend(nativeAdmin.launch, nativeAdmin.unavailable);
       shell.view.append(nativeAdmin.section);
       await nativeAdmin.ready;
       return;

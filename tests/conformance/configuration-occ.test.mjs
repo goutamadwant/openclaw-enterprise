@@ -29,9 +29,10 @@ import {
 } from "../helpers/development.mjs";
 import { bindRole, grantRole, principalIAMState } from "../helpers/iam-grants.mjs";
 import { refusedAnswer } from "../helpers/refusal-answers.mjs";
-import { INSTALLATION_ADMINISTER_DENIED } from "../helpers/refusal-text.mjs";
+import { GATEWAY_MANAGED_MODE_DENIED } from "../helpers/refusal-text.mjs";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
 import { createTestKubernetesComputeDriver } from "../helpers/kubernetes-compute.mjs";
+import { servedAs } from "../helpers/agent-identity.mjs";
 
 const administrator = "principal-configuration-administrator";
 const deployOnly = "principal-configuration-deploy-only";
@@ -252,6 +253,58 @@ test("partial Agent updates keep completed workspace topology unless its Configu
   assert.equal(saved.gatewayManagedMode, false);
 });
 
+test("a new Agent's Gateway managed mode defaults to what the selected Compute Driver enforces", async () => {
+  const { configuration, controller, iamState, namespace } = await fixture();
+  const create = (name, extra = {}) =>
+    controller.createAgent(administrator, {
+      namespaceId: namespace.id,
+      name,
+      configurationId: configuration.id,
+      ...extra,
+    });
+  const unsupported = {
+    name: "ConfigurationHarnessError",
+    message: "Agent setting gatewayManagedMode is not supported by the selected Compute Driver.",
+  };
+  // Kubernetes without a Gateway runtime cannot apply managed mode (finding 2676). The default
+  // is off, which needs no Installation administer: there is nothing to opt out of.
+  registerAndSelectDrivers(controller, [createTestKubernetesComputeDriver("no-gateway-runtime")]);
+  const unmanaged = await create("No Gateway runtime");
+  assert.equal(unmanaged.gatewayManagedMode, false);
+  // Asking for it is refused at save and in the create preflight, not at the next deploy.
+  await assert.rejects(
+    create("Managed without runtime", { gatewayManagedMode: true }),
+    unsupported,
+  );
+  await assert.rejects(
+    controller.validateAgentCreate(administrator, {
+      namespaceId: namespace.id,
+      configuration: { kind: "agent", values: configuration.values },
+      gatewayManagedMode: true,
+    }),
+    unsupported,
+  );
+  // Turning it on later is an Installation administrator's change, refused for the same reason.
+  grantRole(iamState, administrator, {
+    id: "managed-mode-administrator",
+    permissions: { installation: ["administer"] },
+    resource: { kind: "installation", id: installation.id },
+  });
+  await assert.rejects(
+    controller.updateAgent(administrator, {
+      namespaceId: namespace.id,
+      agentId: unmanaged.id,
+      gatewayManagedMode: true,
+    }),
+    unsupported,
+  );
+  // With a Gateway runtime the Driver enforces managed mode, so it is on by default.
+  registerAndSelectDrivers(controller, [
+    createTestKubernetesComputeDriver("gateway-runtime", { gatewayRuntime: true }),
+  ]);
+  assert.equal((await create("Gateway runtime")).gatewayManagedMode, true);
+});
+
 test("only an Installation administrator opts an Agent out of Gateway managed mode or changes it later", async () => {
   const { configuration, controller, iamState, namespace } = await fixture();
   // This fixture's administrator holds Agent create and update in the Namespace but not
@@ -272,7 +325,8 @@ test("only an Installation administrator opts an Agent out of Gateway managed mo
       configuration: ["read"],
     },
   });
-  const denied = { status: 403, code: "FORBIDDEN", message: INSTALLATION_ADMINISTER_DENIED };
+  // The denial names the one field that needs the grant (finding 2691).
+  const denied = { status: 403, code: "FORBIDDEN", message: GATEWAY_MANAGED_MODE_DENIED };
   const refused = (work) => refusedAnswer(work, { actorId: member });
   const create = (principalId, name, mode) =>
     controller.createAgent(principalId, {
@@ -879,7 +933,10 @@ test("a Configuration left ahead of its record by failed updates recovers on the
     resolveApprovedDevelopmentHarness,
   );
   assert.equal(revision.configurationGeneration, 4);
-  assert.deepEqual(revision.configuration, admitLoggingConfiguration(valuesWith(["east"]), "info"));
+  assert.deepEqual(
+    revision.configuration,
+    admitLoggingConfiguration(servedAs(valuesWith(["east"]), agent.name), "info"),
+  );
   // Lost write 1 to 2; lost retry 2 to 3 and its compensation 3 to 2; failed retry 2 to 3;
   // recovery 3 to 4.
   assert.deepEqual(steps, [
@@ -1070,12 +1127,49 @@ test("Agent deployment snapshots its selected Configuration and Compute identity
   assert.equal(revision.configurationId, configuration.id);
   assert.equal(revision.configurationKind, "agent");
   assert.equal(revision.configurationGeneration, configuration.generation);
-  assert.deepEqual(revision.configuration, admitLoggingConfiguration(configuration.values, "info"));
+  assert.deepEqual(
+    revision.configuration,
+    admitLoggingConfiguration(servedAs(configuration.values, agent.name), "info"),
+  );
   assert.equal(Object.isFrozen(configuration.values.models.providers.openai.apiKey), true);
   assert.equal(Object.isFrozen(revision.configuration.plugins.entries.example.regions), true);
   assert.equal(agent.executionMode, "embedded");
   assert.deepEqual(revision.harness, { id: "openclaw", version: "1.0.0", mode: "embedded" });
   assert.deepEqual(revision.compute, { id: compute.id, implementation: compute.implementation });
+});
+
+test("Agent deployment keeps the display name its Configuration sets", async () => {
+  const { agent, configuration, controller, namespace } = await fixture();
+  // The Configuration owner chose this name for the Control UI; the OCC Agent name must not
+  // replace it, and the entry's other identity settings stay as written.
+  const values = {
+    ...configuration.values,
+    agents: {
+      ...configuration.values.agents,
+      // A roster entry selects its own model when agents.defaults.model is unset.
+      entries: {
+        main: {
+          model: "openai/gpt-4.1",
+          models: { "openai/gpt-4.1": { agentRuntime: { id: "openclaw" } } },
+          identity: { name: "Configured name", emoji: "🦞" },
+        },
+      },
+    },
+  };
+  await controller.updateConfiguration(administrator, {
+    namespaceId: namespace.id,
+    configurationId: configuration.id,
+    values,
+  });
+
+  const revision = await controller.deployAgent(
+    administrator,
+    { namespaceId: namespace.id, agentId: agent.id },
+    resolveApprovedDevelopmentHarness,
+  );
+
+  assert.notEqual(agent.name, "Configured name");
+  assert.deepEqual(revision.configuration, admitLoggingConfiguration(values, "info"));
 });
 
 test("native selected-model policy explicitly chooses Codex or OpenClaw", () => {
@@ -1624,8 +1718,23 @@ for (const scope of ["primary", "default-fallback", "entry-fallback", "provider-
     );
 
     assert.deepEqual(configuration.values, values);
-    // Admission freezes the original fallback order for the runtime to execute.
-    assert.deepEqual(admitted.configuration, admitLoggingConfiguration(values, "info"));
+    // Admission freezes the original fallback order for the runtime to execute, and names the
+    // sole roster entry after the OCC Agent.
+    assert.deepEqual(
+      admitted.configuration,
+      admitLoggingConfiguration(
+        {
+          ...values,
+          agents: {
+            ...values.agents,
+            entries: {
+              main: { ...values.agents.entries.main, identity: { name: dedicated.name } },
+            },
+          },
+        },
+        "info",
+      ),
+    );
     assert.deepEqual(admitted.harness, { id: "codex", version: "1.0.0", mode: "dedicated" });
     assert.equal(admitted.compute.id, "configuration-occ-compute");
   });

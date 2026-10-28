@@ -97,7 +97,7 @@ Native chat or other activity in the Agent tab does not renew the console sessio
 
 ## Gateway managed mode
 
-Managed mode defaults on. It prevents Gateway administrators from editing native
+Managed mode defaults on where the Compute Driver supports it. It prevents Gateway administrators from editing native
 configuration, opening Gateway-local terminals, and running Gateway-hosted command
 jobs. An Installation administrator can change the setting in OCE for the next
 deployment. See [Gateway managed mode](agents/gateway-managed-mode.md) for runtime
@@ -108,8 +108,8 @@ requirements and behavior when managed mode is off.
 The native admin UI runs with the same shared native trusted-proxy identity used by workspace files: `occ-workspace-files` with `operator.admin`. OCC attributes availability, proxy admission, and socket closure checks to the human session and exact Agent IAM decision. The native gateway sees the shared service identity, not a per-human native account.
 
 When Gateway managed mode is off, native admin changes affect gateway-local state
-outside OCE Configurations and immutable AgentRevisions. Manage durable
-configuration through OCE. In the Kubernetes pilot, native configuration edits
+outside OCE Configurations and Agent revisions. To keep a setting across Pod
+recreation or redeployment, save it in the OCE Configuration. In the Kubernetes pilot, native configuration edits
 affect a Pod-local copy that resets from the managed snapshot when the Pod is
 recreated or the Agent is redeployed.
 See [Kubernetes managed native configuration](drivers/kubernetes-compute/storage-and-credentials.md#managed-native-configuration)

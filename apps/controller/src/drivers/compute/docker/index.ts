@@ -6,6 +6,7 @@ import type {
   ComputeDriver,
   ComputeAgentBinding,
   ComputeRevisionContext,
+  ConfigurationValidationOptions,
   WorkspaceSetup,
   ComputeReadiness,
   RuntimeImage,
@@ -20,7 +21,12 @@ import type {
 } from "@openclaw-enterprise/contracts";
 import { admittedLoggingLevel } from "@openclaw-enterprise/contracts";
 import { asRecord, immutableCopy, isNonEmptyString, sha256Hex } from "@openclaw-enterprise/utils";
-import { ConfigurationHarnessError, configurationSettingMessage } from "@openclaw-enterprise/occ";
+import {
+  ComputeGatewaySettingError,
+  ConfigurationHarnessError,
+  configurationSettingMessage,
+  keyedSettingPath,
+} from "@openclaw-enterprise/occ";
 import {
   HARNESS_WORKSPACE,
   MANAGED_WORKSPACE,
@@ -49,7 +55,8 @@ import {
 import { embeddedGatewayRecoveryPreamble } from "../embedded-gateway-owner.ts";
 import {
   gatewayManagedModeEnvironment,
-  gatewayStateMigrationHelper,
+  gatewayNodeOptionsEnvironment,
+  openClawStateMigrationHelper,
   startupPhaseHelper,
 } from "../runtime-startup.ts";
 import {
@@ -66,6 +73,7 @@ import {
 import {
   GATEWAY_TOOL_POLICY_RUNTIME,
   managedGatewayConfiguration,
+  validateGatewayToolPolicy,
 } from "../gateway-tool-policy.ts";
 import { validateCodexApprovalPolicySetting } from "../../../gateway/codex-approval-policy.ts";
 import { unsupportedNativeGatewayAuthFields } from "../../../gateway/auth-fields.ts";
@@ -165,7 +173,12 @@ const CONFIGURATION_DOCUMENT = "/home/node/.openclaw/openclaw.json";
 const GATEWAY_PASSWORD_ENV = "OPENCLAW_GATEWAY_PASSWORD";
 const GATEWAY_PASSWORD_REFERENCE = `\${${GATEWAY_PASSWORD_ENV}}`;
 
-function dockerGatewayConfigurationDocument(configuration: OpenClawConfigurationDocument): {
+// Deployment admission (validateGatewaySettings) and preparation apply the same rules, so a
+// deploy that preparation would refuse never stops the running revision first (finding 2352).
+function dockerGatewayConfigurationDocument(
+  configuration: Readonly<OpenClawConfigurationDocument>,
+  createError: SettingError = preparationSettingError,
+): {
   readonly configuration: OpenClawConfigurationDocument;
   readonly requiresManagedPassword: boolean;
 } {
@@ -174,27 +187,24 @@ function dockerGatewayConfigurationDocument(configuration: OpenClawConfiguration
     validateRoutableNativeListener,
     validateCodexApprovalPolicySetting,
   ]) {
-    validate(
-      configuration,
-      (setting, requirement) =>
-        new ConfigurationFailure(`Configuration setting ${setting} ${requirement}.`),
-    );
+    validate(configuration, createError);
   }
   const gatewayRecord = asRecord(configuration.gateway);
   if (configuration.gateway !== undefined && gatewayRecord === undefined) {
-    throw new ConfigurationFailure("Docker native gateway configuration must be an object.");
+    throw createError("gateway", "must be an object");
   }
   const gateway = (gatewayRecord ?? {}) as Record<string, OpenClawConfigurationValue>;
   const authRecord = asRecord(gateway.auth);
   if (gateway.auth !== undefined && authRecord === undefined) {
-    throw new ConfigurationFailure("Docker native gateway auth must be an object.");
+    throw createError("gateway.auth", "must be an object");
   }
   const auth = (authRecord ?? {}) as Record<string, OpenClawConfigurationValue>;
 
   const unsupported = unsupportedNativeGatewayAuthFields(auth);
   if (unsupported.length > 0) {
-    throw new ConfigurationFailure(
-      `Docker native gateway authentication contains unsupported field ${unsupported[0]}.`,
+    throw createError(
+      keyedSettingPath("gateway.auth", unsupported[0]!),
+      "is not a supported native gateway authentication field",
     );
   }
   const passwordReference =
@@ -206,8 +216,9 @@ function dockerGatewayConfigurationDocument(configuration: OpenClawConfiguration
     };
   }
   if (auth.mode !== undefined && auth.mode !== "password") {
-    throw new ConfigurationFailure(
-      "Docker Compute supports only native password or trusted-proxy gateway authentication.",
+    throw createError(
+      "gateway.auth.mode",
+      "must be password or trusted-proxy: Docker Compute supports only native password or trusted-proxy gateway authentication",
     );
   }
 
@@ -251,7 +262,7 @@ const { spawn } = require("node:child_process");
 ${PLUGIN_RUNTIME_HELPERS}
 ${GATEWAY_TOOL_POLICY_RUNTIME}
 ${startupPhaseHelper("gateway")}
-${gatewayStateMigrationHelper("deploy the Agent again")}
+${openClawStateMigrationHelper("Gateway", "deploy the Agent again")}
 
 function forwardTermination(child) {
   let terminating = false;
@@ -269,7 +280,7 @@ function startGateway() {
   const child = spawn(
     "node",
     ["/app/openclaw.mjs", "gateway", "--port", process.env.OPENCLAW_GATEWAY_PORT],
-    { stdio: "inherit", env: { ...process.env, ...${gatewayManagedModeEnvironment(managedMode)} } },
+    { stdio: "inherit", env: { ...process.env, ...${gatewayManagedModeEnvironment(managedMode)}, ...${gatewayNodeOptionsEnvironment()} } },
   );
   forwardTermination(child);
   child.on("exit", (code, signal) => process.exit(code ?? (signal === "SIGTERM" ? 0 : 1)));
@@ -293,11 +304,12 @@ if (gatewayToolPolicyInput !== undefined) configureManagedGatewayTools(gatewayTo
 // reads the configuration written above; current state adds no await before
 // the spawn. A failure exits: the Driver reports the container that stopped
 // before readiness and nothing restarts it.
-const outdatedDatabases = outdatedAgentDatabases();
+const gatewayStateDirectory = process.env.OPENCLAW_STATE_DIR || "/home/node/.openclaw";
+const outdatedDatabases = outdatedOpenClawDatabases(gatewayStateDirectory);
 if (outdatedDatabases.length === 0) {
   startGateway();
 } else {
-  migrateGatewayState(outdatedDatabases).then(
+  migrateOpenClawState(gatewayStateDirectory, outdatedDatabases, process.env).then(
     (migrated) => {
       if (migrated) startGateway();
       else process.exit(1);
@@ -569,9 +581,20 @@ export class DockerComputeDriver implements ComputeDriver {
   }
 
   validateGatewaySettings(configuration: Readonly<OpenClawConfigurationDocument>): void {
-    validatePlaintextNativeGateway(configuration);
-    validateRoutableNativeListener(configuration);
-    validateCodexApprovalPolicySetting(configuration);
+    dockerGatewayConfigurationDocument(
+      configuration,
+      (setting, requirement) => new ComputeGatewaySettingError(setting, requirement),
+    );
+  }
+
+  // An embedded Gateway applies tools.gatewayPolicy natively, so Configuration save, Preset save
+  // and deployment refuse a policy it cannot assemble, with Kubernetes's text (finding 2695).
+  // Dedicated Codex preparation still checks its composed policy.
+  validateConfiguration(
+    configuration: Readonly<OpenClawConfigurationDocument>,
+    options?: ConfigurationValidationOptions,
+  ): void {
+    validateGatewayToolPolicy(configuration, callerSettingError, options);
   }
 
   // Agent create and update apply preparation's workspace rule, with its message. (OCC
