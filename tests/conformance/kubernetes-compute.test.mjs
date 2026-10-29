@@ -68,6 +68,8 @@ import {
   withYieldingComputeStop,
   withYieldingGatewayDrain,
 } from "../../apps/controller/src/drivers/compute/operation-context.ts";
+import { normalizeSecretBindings } from "../../packages/contracts/src/index.ts";
+import { managedGoogleInstall } from "../../apps/controller/src/drivers/plugin/managed-catalog.ts";
 import { assertCleanupFailure } from "../helpers/compute-cleanup-failure.mjs";
 import { createHarnessConfiguration } from "../helpers/harness-configuration.mjs";
 import { syntheticCredentialUrl } from "../fixtures/synthetic-credential-url.mjs";
@@ -1592,6 +1594,71 @@ test("custom Codex endpoints compile explicit providers without changing the adm
       baseUrl: "https://models.example.test/api/v1",
       modelProvider: "openai-compatible",
     });
+  }
+});
+
+test("dedicated OpenClaw delivers the selected Google release digest without a Sandbox provider file", async () => {
+  const { id, releaseSha256 } = managedGoogleInstall;
+  for (const enabled of [true, false]) {
+    const selections = { [id]: { enabled } };
+    let worker;
+    const sandboxDriver = {
+      id: "native-sandbox",
+      implementation: "openshell",
+      capability: "sandbox",
+      facets: ["networking", "filesystem", "process"],
+      async workspaceNodePeerLabels() {
+        return undefined;
+      },
+      async provisionHarness({ requirements, namespace, revision }) {
+        worker = requirements;
+        return {
+          namespaceName: namespace.name,
+          resourceName: "native-harness",
+          agentId: revision.agentId,
+          revisionId: revision.id,
+        };
+      },
+    };
+    const fixture = dedicatedFirstDeployFixture({
+      sandboxDriver,
+      revision: {
+        harness: { id: "openclaw", version: "1.0.0", mode: "dedicated" },
+        sandboxDriverId: sandboxDriver.id,
+        configuration: createHarnessConfiguration("openclaw", "gpt-5"),
+        plugins: {
+          driver: { id: "occ-plugin", implementation: "occ/openclaw-plugin" },
+          plugins: selections,
+        },
+      },
+    });
+    await fixture.prepare();
+    fixture.markReady(fixture.gatewayName);
+    await fixture.prepare();
+    assert.deepEqual(worker.files, []);
+    const gateway = fixture.read("Deployment", fixture.gatewayName).spec.template.spec;
+    for (const environment of [worker.environment, gateway.containers[0].env]) {
+      const digest = environment.find(
+        ({ name }) => name === "OPENCLAW_MANAGED_GOOGLE_RELEASE_SHA256",
+      );
+      assert.equal(digest?.value, enabled ? releaseSha256 : undefined);
+    }
+    if (enabled) {
+      // An Agent editor must not be able to substitute either control with a Secret binding.
+      for (const value of [id, releaseSha256]) {
+        const { name } = gateway.containers[0].env.find((variable) => variable.value === value);
+        assert.throws(
+          () =>
+            normalizeSecretBindings({
+              [name]: { source: { kind: "secret", namespaceId: "ns", id: "secret" } },
+            }),
+          { destinationRule: "reserved_prefix" },
+        );
+      }
+    }
+    const volume = gateway.volumes.find(({ name }) => name === "openclaw-plugin-runtime");
+    const manifest = fixture.read("ConfigMap", volume.configMap.name).data["runtime.json"];
+    assert.deepEqual(JSON.parse(manifest).selections, selections);
   }
 });
 
@@ -9193,6 +9260,7 @@ test("non-model credential sources resolved at dispatch must match the revision'
   const first = source("cs_00000000-0000-4000-8000-000000000851");
   const second = source("cs_00000000-0000-4000-8000-000000000852");
   const revision = {
+    harness: { id: "codex", mode: "dedicated" },
     namespaceId: tenant.id,
     credentialSources: [first, second].map(({ id }) => ({
       sourceId: id,
@@ -9219,6 +9287,49 @@ test("non-model credential sources resolved at dispatch must match the revision'
       why,
     );
   }
+
+  // Plugin selection references an Agent credential. Compute always passes every
+  // active source to its owner, including when a selected source has been withdrawn.
+  const accounts = [first, second].map((tool) => ({
+    ...tool,
+    type: "oauth2-refresh-token",
+    config: {
+      env_var: "GOG_ACCESS_TOKEN",
+      host: "gmail.googleapis.com",
+      path: "/gmail/v1/users/me/messages",
+      token_url: "https://oauth2.googleapis.com/token",
+      scope: "https://www.googleapis.com/auth/gmail.readonly",
+    },
+  }));
+  const native = {
+    ...revision,
+    harness: { id: "openclaw", mode: "dedicated" },
+    harnessAuth: { method: "api_key" },
+    credentialSources: revision.credentialSources.map((ref) => ({
+      ...ref,
+      sourceType: "oauth2-refresh-token",
+    })),
+  };
+  const context = { credentialSources: accounts };
+  const { id, releaseSha256 } = managedGoogleInstall;
+  const bound = {
+    ...native,
+    plugins: {
+      driver: { implementation: "occ/openclaw-plugin" },
+      plugins: {
+        [id]: {
+          enabled: true,
+          driverPolicy: { releaseSha256, credentials: { account: second.id } },
+        },
+      },
+    },
+  };
+  assert.deepEqual(driver.credentialSourcesForRevision(bound, context), accounts);
+  assert.deepEqual(driver.credentialSourcesForRevision(native, context), accounts);
+  assert.deepEqual(
+    driver.credentialSourcesForRevision(bound, { credentialSources: [accounts[0]] }),
+    [accounts[0]],
+  );
 });
 
 test("dedicated OpenClaw gateway receives Agent plugin approvers without plugin selections", () => {

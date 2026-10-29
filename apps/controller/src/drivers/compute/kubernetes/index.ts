@@ -190,6 +190,10 @@ import {
 import { requireHarnessAuthMethod } from "../harness-auth-method.ts";
 import { ComputeLifecycleDispatcher } from "../lifecycle-hooks.ts";
 import {
+  managedGoogleInstall,
+  requireManagedCredentialRuntime,
+} from "../../plugin/managed-catalog.ts";
+import {
   validatePlaintextNativeGateway,
   validateRoutableNativeListener,
 } from "../native-gateway-transport.ts";
@@ -2380,8 +2384,7 @@ function isManagedKubernetesNamespaceName(
     name === kubernetesNamespaceName(namespaceId) ||
     name === previousKubernetesNamespaceName(namespaceId) ||
     // A released split-layout storage namespace adopted as the tenant namespace in place
-    // (docs/guides/deploy/breaking-changes-before-2026-10-10.md, 2026-10-05).
-    // It keeps its storage label.
+    // (docs/guides/deploy/split-layout-upgrade.md). It keeps its storage label.
     (name === kubernetesGatewayNamespaceName(namespaceId) &&
       labels["openclaw.dev/gateway-namespace"] === namespaceId)
   );
@@ -6298,6 +6301,11 @@ export class KubernetesComputeDriver implements ComputeDriver {
     }
     const sandboxDriver = this.sandboxDriverForRevision(revision);
     const providerOwnsHarnessEndpoint = sandboxDriver?.harnessEndpoint !== undefined;
+    requireManagedCredentialRuntime(
+      revision.plugins?.plugins,
+      sandboxDriver?.implementation,
+      this.credentialGatewayDriver?.implementation,
+    );
     requireNativeWorkerSandbox(revision.harness, sandboxDriver);
     if (sandboxDriver !== undefined && embedded) {
       throw new ConfigurationFailure("SandboxDriver support is limited to dedicated Harnesses.");
@@ -11359,7 +11367,15 @@ export class KubernetesComputeDriver implements ComputeDriver {
     if (pluginRuntime === undefined) {
       return [];
     }
-    const data = pluginRuntimeConfigMapData(pluginRuntime.runtime);
+    const { runtime } = pluginRuntime;
+    if (
+      runtime.kind === "openclaw" &&
+      Object.keys(runtime.selections).length === 1 &&
+      Object.hasOwn(runtime.selections, managedGoogleInstall.id)
+    ) {
+      return []; // The Google package is already in the image.
+    }
+    const data = pluginRuntimeConfigMapData(runtime);
     const environment = new Map([
       [PLUGIN_RUNTIME_MANIFEST, PLUGIN_RUNTIME_MANIFEST_ENVIRONMENT],
       [PLUGIN_RUNTIME_CODEX_CONFIG, PLUGIN_RUNTIME_CODEX_CONFIG_ENVIRONMENT],
@@ -15818,6 +15834,22 @@ chmodSync(${JSON.stringify(nodeStatePath)}, 0o700);`;
         variables.push({
           name: "OPENCLAW_NATIVE_WORKER_PROFILE",
           value: configuration.nativeWorkerProfile,
+        });
+      }
+    }
+    // The native worker consumes only the image release digest. Its Sandbox needs no plugin files.
+    if (dedicated && pluginRuntime?.runtime.kind === "openclaw") {
+      const selection = pluginRuntime.runtime.selections[managedGoogleInstall.id];
+      if (selection !== undefined && role === "gateway") {
+        variables.push({
+          name: "OPENCLAW_MANAGED_GOOGLE_PLUGIN_ID",
+          value: managedGoogleInstall.id,
+        });
+      }
+      if (selection?.enabled) {
+        variables.push({
+          name: "OPENCLAW_MANAGED_GOOGLE_RELEASE_SHA256",
+          value: managedGoogleInstall.releaseSha256,
         });
       }
     }
