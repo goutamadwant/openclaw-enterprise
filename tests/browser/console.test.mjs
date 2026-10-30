@@ -2905,10 +2905,18 @@ test("login ignores untrusted returns and resolves an opaque Agent key only afte
   await page.getByRole("heading", { name: "Shared Agent", exact: true }).waitFor();
   assert.equal(await page.getByRole("heading", { name: "Native admin UI" }).count(), 0);
   assert.equal(lookups, 1);
+  expireSessions(fixture);
+  await page.evaluate(() => globalThis.dispatchEvent(new Event("focus")));
+  await page.getByText("Your session has expired.", { exact: true }).waitFor();
+  allow = false;
+  await page.getByLabel("Email", { exact: true }).fill(fixture.credentials.email);
+  await page.getByLabel("Password").fill(fixture.credentials.password);
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.getByRole("heading", { name: "Shared Agent", exact: true }).waitFor();
+  assert.equal(lookups, 1, "a readable Agent return must not replay its opaque native key");
   await page.goto(`${fixture.origin}/console/`);
   await page.waitForURL(/\/console\/agents(?:\?|$)/);
   assert.equal(lookups, 1);
-  allow = false;
   await page.goto(`${fixture.origin}/console/#native-agent=${key}`);
   await page.waitForURL(/\/console\/agents(?:\?|$)/);
   assert.equal(lookups, 2);
@@ -3058,6 +3066,19 @@ test("native recovery remains usable with exact Agent administer and no Namespac
       true,
     );
     if (account === limited) {
+      for (const gate of ["/api/auth/session", "/namespaces"]) {
+        await page.route(`**${gate}`, (route) => route.fulfill({ status: 503 }), { times: 1 });
+        await page.evaluate(() => globalThis.dispatchEvent(new Event("focus")));
+        await page
+          .getByRole("heading", {
+            name:
+              gate === "/api/auth/session" ? "Session unavailable" : "Namespace access unavailable",
+            exact: true,
+          })
+          .waitFor();
+        await page.getByRole("button", { name: "Retry", exact: true }).click();
+        await launch.waitFor();
+      }
       const statusPath = `/namespaces/${namespace.id}/agents/${agent.id}/native-admin`;
       const owner = await page.evaluate(() => {
         const stored = JSON.parse(
@@ -3110,6 +3131,36 @@ test("native recovery remains usable with exact Agent administer and no Namespac
         3,
       );
     }
+  }
+
+  for (const resourceKind of ["agent", "namespace"]) {
+    const { page: revokedPage } = await newPage(t, fixture, {
+      args: [
+        ...fixture.browserArgs,
+        `--host-resolver-rules=MAP ${consoleHost} 127.0.0.1,MAP *.${nativeDomain} 127.0.0.1`,
+      ],
+    });
+    await revokedPage.goto(`${fixture.origin}/console/#native-agent=${key}`);
+    await revokedPage.getByLabel("Email", { exact: true }).fill(fixture.credentials.email);
+    await revokedPage.getByLabel("Password").fill(fixture.credentials.password);
+    await revokedPage.getByRole("button", { name: "Sign in" }).click();
+    await revokedPage
+      .getByRole("heading", { name: "Native recovery Agent", exact: true })
+      .waitFor();
+    const restriction = {
+      id: `deny-native-return-${resourceKind}-read`,
+      namespaceId: namespace.id,
+      resourceKind,
+      resourceId: resourceKind === "agent" ? agent.id : namespace.id,
+      action: "read",
+      effect: "deny",
+    };
+    fixture.policy.restrictions.push(restriction);
+    await revokedPage.evaluate(() => globalThis.dispatchEvent(new Event("focus")));
+    await revokedPage.getByRole("heading", { name: "Native admin UI", exact: true }).waitFor();
+    await revokedPage.getByRole("link", { name: "Open Agent UI", exact: true }).waitFor();
+    assert.equal(await revokedPage.getByRole("heading", { name: "Access denied" }).count(), 0);
+    fixture.policy.restrictions.splice(fixture.policy.restrictions.indexOf(restriction), 1);
   }
 });
 

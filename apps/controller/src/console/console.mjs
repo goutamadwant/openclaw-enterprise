@@ -1244,13 +1244,20 @@ function clearDrafts() {
   draftUserId = null;
 }
 
+function matchesNativeRecovery(current, owner, selectedNamespace) {
+  return (
+    nativeRecovery?.owner === owner &&
+    current.feature === "agents" &&
+    current.agentId === nativeRecovery.agentId &&
+    selectedNamespace === nativeRecovery.namespaceId
+  );
+}
+
 function expiredDestination(current) {
   // Keep only a validated read destination; reset private views and drafts in showLogin.
   const nativeDestination =
-    nativeRecovery !== null &&
-    current.feature === "agents" &&
-    current.agentId === nativeRecovery.agentId &&
-    current.namespace === nativeRecovery.namespaceId
+    nativeRecovery?.required === true &&
+    matchesNativeRecovery(current, nativeRecovery.owner, current.namespace)
       ? { kind: "native", key: nativeRecovery.key }
       : null;
   return pendingIntent ?? nativeDestination ?? loginDestination(current);
@@ -1897,6 +1904,7 @@ async function loadPage({
           key: destination.key,
           namespaceId: resolved?.namespaceId,
           agentId: resolved?.agentId,
+          required: true,
         };
         pendingIntent = null;
         replaceUrl(targetUrl);
@@ -1958,11 +1966,7 @@ async function loadPage({
         namespaces[0]
       )?.id ??
       null;
-    const nativeRecoveryTarget =
-      nativeRecovery?.owner === owner &&
-      current.feature === "agents" &&
-      current.agentId === nativeRecovery.agentId &&
-      namespaceId === nativeRecovery.namespaceId;
+    const nativeRecoveryTarget = matchesNativeRecovery(current, owner, namespaceId);
     if (nativeRecovery !== null && !nativeRecoveryTarget) {
       nativeRecovery = null;
     }
@@ -2005,6 +2009,9 @@ async function loadPage({
           firstAgent = await request(
             `/namespaces/${encodeURIComponent(namespaceId)}/agents/${encodeURIComponent(current.agentId)}`,
           );
+          if (nativeRecoveryTarget) {
+            nativeRecovery.required = false;
+          }
         } catch (error) {
           if (nativeRecoveryTarget && error.status === 403) {
             recoveringNativeAdmin = true;
@@ -2681,8 +2688,15 @@ async function loadPage({
       // Uncertain shared admission invalidates every preview, not just this route. Drafts stay:
       // a later read clears them only if it proves their Namespace or account gone (finding 1935).
       const account = session;
+      const retainedNativeRecovery =
+        (error.status === undefined || error.status === 429 || error.status >= 500) &&
+        nativeRecovery?.required === true &&
+        matchesNativeRecovery(current, sessionOwnerKey(account), current.namespace)
+          ? nativeRecovery
+          : null;
       resetReads();
       clearPrivate();
+      nativeRecovery = retainedNativeRecovery;
       shell = null;
       showAdmissionUnavailable(sessionResolved, error, account);
       return;
@@ -2983,6 +2997,11 @@ async function revalidateMountedAgent(current) {
     session = resolvedSession;
     setNamespaces(readable);
     if (!namespaces.some((item) => item.id === selectedNamespace)) {
+      if (matchesNativeRecovery(current, owner, selectedNamespace)) {
+        nativeRecovery.required = true;
+        await loadPage();
+        return;
+      }
       clearRetainedViewsForNamespace(selectedNamespace);
       resetReads();
       namespaceUnavailablePanel(renderShell(current.feature, false, { page: null }).view);
@@ -3050,6 +3069,11 @@ async function revalidateMountedAgent(current) {
       const account = session;
       clearPrivate();
       showAdmissionUnavailable(checking !== "session", error, account);
+      return;
+    }
+    if (error.status === 403 && matchesNativeRecovery(current, owner, selectedNamespace)) {
+      nativeRecovery.required = true;
+      await loadPage();
       return;
     }
     showAgentReadFailure(current, selectedNamespace, error);
