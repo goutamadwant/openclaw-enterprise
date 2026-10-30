@@ -760,7 +760,6 @@ export function renderCreateAgent(context: CreateAgentContext, restored?: unknow
 const MEMBER_CREDENTIAL_ACCESS =
   "An Installation administrator then gives the new Agent access to its Secrets.";
 const MEMBER_GRANT_REFUSED = `The Agent was created as a draft. Giving it access to its saved model and channel Secrets needs Installation administration. ${askAdministratorTo("open the saved Agent and grant it")}`;
-const INSTALLATION_REFUSAL = `Creating an Agent needs Installation access that your account does not have. ${askAdministratorTo("create this Agent")}`;
 // The Installation read was refused and the Namespace's permission answer is unknown (its read
 // failed), so whether this account may create Agents here is not known (finding 2110).
 const PERMISSIONS_UNREAD =
@@ -880,7 +879,7 @@ function renderAgentForm(
   const auth = responseFields(agent.harnessAuth);
   const method = auth.method;
   const keyMethod = method === "api_key" || method === "codex_pat" ? method : undefined;
-  const passwordAuth = Object.hasOwn(auth, "secret");
+  let passwordAuth = Object.hasOwn(auth, "secret");
   const authDefault = keyMethod && Object.keys(auth).length === 1 ? keyMethod : undefined;
   let binding: HarnessAuthBinding | undefined;
   if (passwordAuth) {
@@ -1139,6 +1138,68 @@ function renderAgentForm(
     disabled: Boolean(binding || passwordAuth),
   });
   const modelCredentialField = modelCredentialPicker.field;
+  let secretNameConflict: string | null = null;
+  const secretConflictMessage = element("p", { className: "status-body" });
+  const ownsSecretRecovery = () =>
+    passwordAuth && !binding && ["api_key", "codex_pat"].includes(authMethod.value) && !savedSecret;
+  function clearSecretConflictFeedback() {
+    secretNameConflict = null;
+    secretConflictMessage.textContent = "";
+    secretConflictRecovery.hidden = true;
+  }
+  function clearSecretRecovery() {
+    clearSecretConflictFeedback();
+    alternateSecretField.hidden = true;
+    alternateSecretName.value = "";
+    alternateSecretName.required = false;
+    alternateSecretName.setCustomValidity("");
+  }
+  const alternateSecretName = element("input", {
+    id: "alternate-model-secret-name",
+    autocomplete: "off",
+    "data-trim": "",
+  });
+  const alternateSecretField = field("New Secret name", alternateSecretName);
+  alternateSecretField.hidden = true;
+  const requestedModelSecretName = () =>
+    (alternateSecretField.hidden ? name.value : alternateSecretName.value).trim();
+  function clearSupersededSecretConflict() {
+    if (secretNameConflict !== null && secretNameConflict !== requestedModelSecretName()) {
+      clearSecretConflictFeedback();
+    }
+  }
+  const chooseExistingSecret = button("Choose existing Secret", () => {
+    if (pending || outcomeUnknown || !ownsSecretRecovery() || !secretNameConflict) {
+      return;
+    }
+    passwordAuth = false;
+    pluginDiscoveryTokenDetails.append(transientCredentialField);
+    credentialStorageHelp.textContent =
+      "If no Secret is selected, enter a service account token to preview plugins. Agent creation uses the selected Secret; its value stays on the server.";
+    operateAnswer.reset();
+    apiKey.value = "";
+    resetPluginDiscovery();
+    clearSecretRecovery();
+    feedback.textContent =
+      "Choose an existing model credential Secret, then select Create Agent. Your other draft fields are unchanged.";
+    updateControls();
+    modelCredentialField.querySelector("input")?.focus();
+  });
+  const chooseAlternateName = button("Use another Secret name", () => {
+    if (pending || outcomeUnknown || !ownsSecretRecovery() || !secretNameConflict) {
+      return;
+    }
+    alternateSecretField.hidden = false;
+    alternateSecretName.required = true;
+    alternateSecretName.focus();
+  });
+  const secretConflictRecovery = statusBlock(
+    "warning",
+    null,
+    secretConflictMessage,
+    [chooseExistingSecret, chooseAlternateName],
+    { id: "model-secret-conflict", hidden: true },
+  );
   const oauthLogin = createDeviceLogin({
     context,
     initial: draft.oauthLogin,
@@ -1152,19 +1213,20 @@ function renderAgentForm(
       }
     },
   });
+  const credentialStorageHelp = element(
+    "p",
+    { className: "hint" },
+    passwordAuth
+      ? "Stored as a Secret for this Agent. Credentials are never included in Configuration JSON."
+      : "If no Secret is selected, enter a service account token to preview plugins. Agent creation uses the selected Secret; its value stays on the server.",
+  );
   const transientCredentialField = element(
     "div",
     { className: "form-field" },
     credentialLabel,
     apiKey,
     credentialHelp,
-    element(
-      "p",
-      { className: "hint" },
-      passwordAuth
-        ? "Stored as a Secret for this Agent. Credentials are never included in Configuration JSON."
-        : "If no Secret is selected, enter a service account token to preview plugins. Agent creation uses the selected Secret; its value stays on the server.",
-    ),
+    credentialStorageHelp,
   );
   const pluginDiscoveryTokenDetails = element(
     "details",
@@ -1198,7 +1260,10 @@ function renderAgentForm(
       ? [
           modelCredentialField,
           oauthLogin.section,
-          passwordAuth ? transientCredentialField : pluginDiscoveryTokenDetails,
+          passwordAuth ? transientCredentialField : null,
+          pluginDiscoveryTokenDetails,
+          secretConflictRecovery,
+          alternateSecretField,
         ]
       : []),
     modelSection,
@@ -1445,6 +1510,7 @@ function renderAgentForm(
     renderChannelEditor();
   }
   function clearModelCredential() {
+    clearSecretRecovery();
     apiKey.value = "";
     modelCredentialSource = null;
     modelCredentialSecret = undefined;
@@ -1768,17 +1834,32 @@ function renderAgentForm(
   // Granting an Agent access to its Secrets is Installation administration, so the member learns
   // before Create that an administrator finishes that step.
   const namespaceName = context.namespace?.name ?? "this Namespace";
-  const accessStatus = statusBlock(
-    "info",
-    "Your access",
-    `${
-      typeof presetOptions.presetName === "string"
-        ? `You can create Agents in ${namespaceName}. Installation-wide capabilities are not readable with your access, so the options below come from this Namespace's Presets.`
-        : `You can create Agents in ${namespaceName}. Installation-wide capabilities are not readable with your access, so Create Agent checks the Configuration with the server before saving it.`
-    } ${MEMBER_CREDENTIAL_ACCESS}`,
-    [],
-    { id: "create-agent-access", hidden: true },
+  const memberAccess = `${
+    typeof presetOptions.presetName === "string"
+      ? `You can create Agents in ${namespaceName}. Installation-wide capabilities are not readable with your access, so the options below come from this Namespace's Presets.`
+      : `You can create Agents in ${namespaceName}. Installation-wide capabilities are not readable with your access, so Create Agent checks the Configuration with the server before saving it.`
+  } ${MEMBER_CREDENTIAL_ACCESS}`;
+  // A refused Installation read with no known Agent create grant is a refusal, not a hint: it
+  // takes the same slot, with the permission retry as its action (finding 2092).
+  const retryPermissionCheck = button("Retry permission check", () => void rereadPermissions(), {
+    tone: "secondary",
+  });
+  const accessBody = element("p", { className: "status-body" }, memberAccess);
+  const accessActions = element(
+    "div",
+    { className: "status-actions", hidden: true },
+    retryPermissionCheck,
   );
+  const accessStatus = statusBlock("info", "Your access", [accessBody, accessActions], [], {
+    id: "create-agent-access",
+    hidden: true,
+  });
+  function showAccess(tone: "info" | "warning" | "danger", body: string) {
+    setStatusTone(accessStatus, tone);
+    setText(accessBody, body);
+    accessActions.hidden = !permissionsUnknown;
+    accessStatus.hidden = false;
+  }
   // The Preset this form started from (flows.md C8).
   const presetBadge =
     typeof presetOptions.presetName === "string"
@@ -1909,9 +1990,9 @@ function renderAgentForm(
     },
     { tone: "danger" },
   );
+  // A refused Installation read stays refused: its access block offers a permission reread instead.
   const retryCapabilityDiscovery = button("Retry capability check", () => {
-    // A refused Installation read stays refused: reread only the permission answer.
-    void (capabilityDiscoveryDenied ? rereadPermissions() : loadInstallationCapabilities());
+    void loadInstallationCapabilities();
   });
   const recoveryMessage = element("p", { className: "muted" });
   const requireRepositoryReload = () => {
@@ -2035,6 +2116,9 @@ function renderAgentForm(
         updateControls();
       },
       { ...agent, ...(draft.repositoryAccess ? { repositoryAccess: draft.repositoryAccess } : {}) },
+      // New-Agent repository choices authorize Agent create: read them once an answer allows it,
+      // never to learn the answer (finding 2909).
+      { held: namespacePermissions?.agents?.create !== true },
     )).section,
     pluginFields.section,
     element(
@@ -2065,6 +2149,9 @@ function renderAgentForm(
       control instanceof HTMLTextAreaElement
     ) {
       control.setCustomValidity("");
+    }
+    if (event.target === name || event.target === alternateSecretName) {
+      clearSupersededSecretConflict();
     }
     if (event.target === name) {
       checkName();
@@ -2750,7 +2837,15 @@ function renderAgentForm(
         : "API key"
       : "Token for plugin discovery";
     modelCredentialField.hidden = Boolean(binding || passwordAuth || usesOAuth);
-    transientCredentialField.hidden = usesOAuth;
+    transientCredentialField.hidden =
+      usesOAuth || (!passwordAuth && transientCredentialField.parentElement === authSection);
+    if (!ownsSecretRecovery()) {
+      clearSecretConflictFeedback();
+      alternateSecretField.hidden = true;
+      alternateSecretName.required = false;
+    }
+    clearSupersededSecretConflict();
+    secretConflictRecovery.hidden = secretNameConflict === null || outcomeUnknown;
     pluginDiscoveryTokenDetails.hidden = Boolean(
       binding || passwordAuth || !usesPat || pluginDiscoveryCredential === "none",
     );
@@ -2855,6 +2950,9 @@ function renderAgentForm(
       (namespaceRefusesAgents() || (!selectedModeUnavailable() && provisioningWaitsForNamespace()))
     ) {
       submit.setAttribute("aria-describedby", capabilityStatus.id);
+    } else if (capabilityDiscoveryDenied && !capabilitiesUnreadable && !accessStatus.hidden) {
+      // The refused Installation read's block above the form says why Create waits (finding 2092).
+      submit.setAttribute("aria-describedby", accessStatus.id);
     } else {
       submit.removeAttribute("aria-describedby");
     }
@@ -2864,12 +2962,9 @@ function renderAgentForm(
     removeCredentialRegistration.disabled = pending;
     retryProvisioning.hidden = !provisioningAttempt;
     retryProvisioning.disabled = pending || !provisioningAttempt;
-    retryCapabilityDiscovery.hidden =
-      !capabilityDiscoveryFailed || (capabilityDiscoveryDenied && !permissionsUnknown);
-    retryCapabilityDiscovery.disabled = pending || permissionsReading;
-    retryCapabilityDiscovery.textContent = capabilityDiscoveryDenied
-      ? "Retry permission check"
-      : "Retry capability check";
+    retryCapabilityDiscovery.hidden = !capabilityDiscoveryFailed || capabilityDiscoveryDenied;
+    retryCapabilityDiscovery.disabled = pending;
+    retryPermissionCheck.disabled = pending || permissionsReading;
     submit.hidden = credentialGrantRefused;
     submit.textContent = savedAgent ? "Retry credential access" : "Create Agent";
     submit.setAttribute("aria-busy", createPending ? "true" : "false");
@@ -2967,6 +3062,14 @@ function renderAgentForm(
         provisionableExecutionModes.add(executionMode);
       }
       capabilityDiscoveryDone = true;
+      // A readable Installation is an administrator's: without a permission answer, the form
+      // goes on as allowed, and so do its repository choices. A known refusal (a kept draft a
+      // Restriction now refuses) reads none and says why: nothing else on the form does.
+      if (namespacePermissions?.agents?.create === false) {
+        repositories.refuse(agentCreateDenied(namespacePermissions));
+      } else {
+        repositories.start();
+      }
       // A mode the form chose but the Installation refuses becomes the usable one, if any.
       if (
         openclawExecutionModes !== undefined &&
@@ -3006,22 +3109,34 @@ function renderAgentForm(
   }
   // After a refused Installation read, the permission answer decides. A member the Namespace lets
   // create Agents goes on without the Installation's capabilities (UX plan A2); only an explicit
-  // grant does. A known denial keeps the refusal; an unknown answer says the check failed and
-  // offers a retry of it (finding 2110).
+  // grant does. An unknown answer says the check failed and offers a retry of it (finding 2110).
+  // A known denial shows what a fresh load with that answer shows: the refusal instead of the form
+  // (finding 2908). A form that already saved resources keeps them in view, under the same refusal.
   function settleRefusedCapabilities() {
     const create = namespacePermissions?.agents?.create;
     permissionsUnknown = typeof create !== "boolean";
+    capabilityStatus.textContent = "";
     if (create === true) {
       capabilitiesUnreadable = true;
-      accessStatus.hidden = false;
+      showAccess("info", memberAccess);
+      repositories.start();
       return;
     }
-    capabilityStatus.textContent = permissionsUnknown ? PERMISSIONS_UNREAD : INSTALLATION_REFUSAL;
+    if (permissionsUnknown) {
+      showAccess("warning", PERMISSIONS_UNREAD);
+    } else if (!savedSecret && !savedCredentialSource && !savedConfiguration && !savedAgent) {
+      context.permissions = namespacePermissions;
+      renderCreateAgent(context);
+    } else {
+      showAccess("danger", agentCreateDenied(namespacePermissions));
+      // The block above gives the reason; the held repository line no longer waits for anything.
+      repositories.refuse();
+    }
   }
   async function rereadPermissions() {
     operateAnswer.reset();
     permissionsReading = true;
-    capabilityStatus.textContent = "Checking your permissions in this Namespace…";
+    showAccess("info", "Checking your permissions in this Namespace…");
     updateControls();
     try {
       namespacePermissions = (await request(
@@ -3040,16 +3155,27 @@ function renderAgentForm(
     if (!context.isCurrent()) {
       return;
     }
-    settleRefusedCapabilities();
-    updateControls();
-    // The retry hides once answered: its outcome takes focus rather than the page.
+    // The pressed retry was disabled while the check ran: it takes focus back when the check
+    // failed again; once answered it hides and the answer takes focus rather than the page.
     const active = document.activeElement;
-    if (
-      retryCapabilityDiscovery.hidden &&
-      (!active || active === document.body || active === retryCapabilityDiscovery)
-    ) {
-      const outcome = accessStatus.hidden ? capabilityStatus : accessStatus;
-      outcome.tabIndex = -1;
+    const focusOutcome = !active || active === document.body || active === retryPermissionCheck;
+    settleRefusedCapabilities();
+    if (!form.isConnected) {
+      // The refusal replaced the form: it is the answer.
+      const refusal = context.view.querySelector<HTMLElement>(".state-panel");
+      if (focusOutcome && refusal) {
+        refusal.tabIndex = -1;
+        refusal.focus({ preventScroll: true });
+        refusal.scrollIntoView({ block: "nearest" });
+      }
+      return;
+    }
+    updateControls();
+    if (focusOutcome) {
+      const outcome = accessActions.hidden ? accessStatus : retryPermissionCheck;
+      if (outcome === accessStatus) {
+        accessStatus.tabIndex = -1;
+      }
       outcome.focus({ preventScroll: true });
       outcome.scrollIntoView({ block: "nearest" });
     }
@@ -3264,6 +3390,9 @@ function renderAgentForm(
     event.preventDefault();
     // A restored draft sets the name and files without an input event.
     checkName();
+    if (ownsSecretRecovery() && !alternateSecretField.hidden) {
+      alternateSecretName.setCustomValidity(namespaceNameProblem(alternateSecretName.value.trim()));
+    }
     // The Workspace tab's check, naming the file; validateFields opens Advanced settings to it
     // (finding 2341).
     for (const [filename, input] of workspaceInputs) {
@@ -3378,6 +3507,7 @@ function renderAgentForm(
     }
     pending = true;
     createPending = true;
+    clearSecretConflictFeedback();
     updateControls();
     feedback.textContent = "";
     // A typed key becomes a new Secret that the next requests bind. It gets no Secret operate
@@ -3476,6 +3606,7 @@ function renderAgentForm(
     context.setDraftCapture(null);
     let mutationStarted = false;
     let creatingSecret = false;
+    const requestedSecretName = requestedModelSecretName();
     let refusedInConfiguration = false;
     try {
       if (passwordAuth && !usesOAuth && !savedSecret) {
@@ -3484,10 +3615,10 @@ function renderAgentForm(
         const result = await request(`${namespacePath(namespaceId)}/secrets`, {
           method: "POST",
           expectedStatus: 201,
-          body: { name: body.name, value: apiKey.value },
+          body: { name: requestedSecretName, value: apiKey.value },
         });
         apiKey.value = "";
-        const secret = secretMetadata(result, namespaceId, body.name);
+        const secret = secretMetadata(result, namespaceId, requestedSecretName);
         if (!secret) {
           throw new Error("The create response did not identify the requested Secret.");
         }
@@ -3728,6 +3859,20 @@ function renderAgentForm(
         context.onExpired();
         return;
       }
+      const confirmedSecretConflict =
+        creatingSecret &&
+        error.status === 409 &&
+        error.code === "RESOURCE_CONFLICT" &&
+        error.serverMessage ===
+          "A Secret with this name already exists in this Namespace. Choose a different name.";
+      if (confirmedSecretConflict) {
+        secretNameConflict = requestedSecretName;
+        secretConflictMessage.textContent = withRequestId(
+          `A Secret named "${requestedSecretName}" already exists in this Namespace. Choose an existing Secret or use another Secret name. Other draft fields stay unchanged.`,
+          error.requestId,
+        );
+        secretConflictRecovery.hidden = false;
+      }
       const registrationProblem =
         error.status && error.status >= 400 ? ` ${describeFailure(cause, { mutation: true })}` : "";
       // A refused grant on a saved Agent shows this text only to an Installation administrator (a
@@ -3736,8 +3881,8 @@ function renderAgentForm(
         ? `Credential Source registration could not be confirmed.${registrationProblem} Check credential registration before retrying; the selected Secret remains saved.`
         : savedAgent
           ? `The Agent was created, but credential access is not confirmed. ${administratorMessage(cause)} Retry credential access, or open the saved Agent and check its access to its saved model and channel Secrets.`
-          : error.status === 409 && creatingSecret && error.code !== "NAMESPACE_NOT_READY"
-            ? `A Secret named "${body.name}" already exists in this Namespace, possibly from an earlier Agent with this name. Choose another Agent name, delete that Secret, or select Start over, choose the Preset again, and set its Secret source to Use existing Secret.`
+          : confirmedSecretConflict
+            ? ""
             : error.status === 409 && savedConfiguration && error.code !== "NAMESPACE_NOT_READY"
               ? error.serverMessage === AGENT_NAME_CONFLICT
                 ? AGENT_NAME_CONFLICT
@@ -3785,12 +3930,13 @@ function renderAgentForm(
         error.status === 403;
       credentialGrantRefused ||= memberGrantRefused;
       refusedInConfiguration = !savedConfiguration && showChannelBindingRefusal(cause);
-      feedback.textContent = refusedInConfiguration
-        ? ""
-        : (memberGrantRefused ? MEMBER_GRANT_REFUSED : detail) +
-          guidance +
-          (error.requestId ? ` ${requestIdText(error.requestId)}` : "");
-      focusFeedbackLine(feedback);
+      feedback.textContent =
+        refusedInConfiguration || confirmedSecretConflict
+          ? ""
+          : (memberGrantRefused ? MEMBER_GRANT_REFUSED : detail) +
+            guidance +
+            (error.requestId ? ` ${requestIdText(error.requestId)}` : "");
+      focusFeedbackLine(confirmedSecretConflict ? secretConflictRecovery : feedback);
       // A create that raced another Agent to the name (the preflight checked it).
       if (!savedAgent && error.status === 409 && error.serverMessage === AGENT_NAME_CONFLICT) {
         markNameTaken();

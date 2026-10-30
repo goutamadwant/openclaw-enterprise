@@ -197,6 +197,10 @@ export const CreateCapabilitiesDenied = {
   ...story("createCapabilitiesDenied"),
   name: "Permission check failed",
 };
+export const CreatePermissionRetryDenied = {
+  ...story("createPermissionRetryDenied"),
+  name: "Permission retry refuses Agent create",
+};
 export const CreateMember = {
   ...story("createMember"),
   name: "Member with Agent create",
@@ -346,3 +350,9 @@ export const RosterModelPrimary = {
   ...story("createRosterModelSelection"),
   name: "Change a roster's shared primary model",
 };
+
+export const PasswordSecretConflict = story("createPasswordSecretConflict");
+
+export const PasswordSecretConflictPat = story("createPasswordSecretConflictPat");
+
+export const PasswordSecretConflictOAuth = story("createPasswordSecretConflictOAuth");
