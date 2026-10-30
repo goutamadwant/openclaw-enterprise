@@ -1253,6 +1253,10 @@ function matchesNativeRecovery(current, owner, selectedNamespace) {
   );
 }
 
+function retryableAdmissionFailure(error) {
+  return error.status === undefined || error.status === 429 || error.status >= 500;
+}
+
 function expiredDestination(current) {
   // Keep only a validated read destination; reset private views and drafts in showLogin.
   const nativeDestination =
@@ -2689,8 +2693,7 @@ async function loadPage({
       // a later read clears them only if it proves their Namespace or account gone (finding 1935).
       const account = session;
       const retainedNativeRecovery =
-        (error.status === undefined || error.status === 429 || error.status >= 500) &&
-        nativeRecovery?.required === true &&
+        retryableAdmissionFailure(error) &&
         matchesNativeRecovery(current, sessionOwnerKey(account), current.namespace)
           ? nativeRecovery
           : null;
@@ -3064,10 +3067,15 @@ async function revalidateMountedAgent(current) {
       return;
     }
     if (checking !== "detail") {
+      const retainedNativeRecovery =
+        retryableAdmissionFailure(error) && matchesNativeRecovery(current, owner, selectedNamespace)
+          ? nativeRecovery
+          : null;
       resetReads();
       // Drafts survive an unavailable check, as in loadPage (finding 1935).
       const account = session;
       clearPrivate();
+      nativeRecovery = retainedNativeRecovery;
       showAdmissionUnavailable(checking !== "session", error, account);
       return;
     }

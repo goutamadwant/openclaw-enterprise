@@ -3133,7 +3133,10 @@ test("native recovery remains usable with exact Agent administer and no Namespac
     }
   }
 
-  for (const resourceKind of ["agent", "namespace"]) {
+  for (const [resourceKind, transientGate] of [
+    ["agent", "/api/auth/session"],
+    ["namespace", "/namespaces"],
+  ]) {
     const { page: revokedPage } = await newPage(t, fixture, {
       args: [
         ...fixture.browserArgs,
@@ -3144,6 +3147,23 @@ test("native recovery remains usable with exact Agent administer and no Namespac
     await revokedPage.getByLabel("Email", { exact: true }).fill(fixture.credentials.email);
     await revokedPage.getByLabel("Password").fill(fixture.credentials.password);
     await revokedPage.getByRole("button", { name: "Sign in" }).click();
+    await revokedPage
+      .getByRole("heading", { name: "Native recovery Agent", exact: true })
+      .waitFor();
+    await revokedPage.route(`**${transientGate}`, (route) => route.fulfill({ status: 503 }), {
+      times: 1,
+    });
+    await revokedPage.evaluate(() => globalThis.dispatchEvent(new Event("focus")));
+    await revokedPage
+      .getByRole("heading", {
+        name:
+          transientGate === "/api/auth/session"
+            ? "Session unavailable"
+            : "Namespace access unavailable",
+        exact: true,
+      })
+      .waitFor();
+    await revokedPage.getByRole("button", { name: "Retry", exact: true }).click();
     await revokedPage
       .getByRole("heading", { name: "Native recovery Agent", exact: true })
       .waitFor();
