@@ -3182,6 +3182,49 @@ test("native recovery remains usable with exact Agent administer and no Namespac
     assert.equal(await revokedPage.getByRole("heading", { name: "Access denied" }).count(), 0);
     fixture.policy.restrictions.splice(fixture.policy.restrictions.indexOf(restriction), 1);
   }
+
+  for (const resourceKind of ["agent", "namespace"]) {
+    const { page: refreshedPage } = await newPage(t, fixture, {
+      args: [
+        ...fixture.browserArgs,
+        `--host-resolver-rules=MAP ${consoleHost} 127.0.0.1,MAP *.${nativeDomain} 127.0.0.1`,
+      ],
+    });
+    const refreshedRequests = apiRequests(refreshedPage, fixture.origin);
+    await refreshedPage.goto(`${fixture.origin}/console/#native-agent=${key}`);
+    await refreshedPage.getByLabel("Email", { exact: true }).fill(fixture.credentials.email);
+    await refreshedPage.getByLabel("Password").fill(fixture.credentials.password);
+    await refreshedPage.getByRole("button", { name: "Sign in" }).click();
+    await refreshedPage
+      .getByRole("heading", { name: "Native recovery Agent", exact: true })
+      .waitFor();
+    const fullLoadRestriction = {
+      id: `deny-native-return-${resourceKind}-read-on-refresh`,
+      namespaceId: namespace.id,
+      resourceKind,
+      resourceId: resourceKind === "agent" ? agent.id : namespace.id,
+      action: "read",
+      effect: "deny",
+    };
+    fixture.policy.restrictions.push(fullLoadRestriction);
+    await refreshedPage.getByRole("button", { name: "Refresh", exact: true }).click();
+    await refreshedPage.getByRole("heading", { name: "Native admin UI", exact: true }).waitFor();
+    await refreshedPage.getByRole("link", { name: "Open Agent UI", exact: true }).waitFor();
+    expireSessions(fixture);
+    await refreshedPage.evaluate(() => globalThis.dispatchEvent(new Event("focus")));
+    await refreshedPage.getByText("Your session has expired.", { exact: true }).waitFor();
+    await refreshedPage.getByLabel("Email", { exact: true }).fill(fixture.credentials.email);
+    await refreshedPage.getByLabel("Password").fill(fixture.credentials.password);
+    await refreshedPage.getByRole("button", { name: "Sign in" }).click();
+    await refreshedPage.getByRole("link", { name: "Open Agent UI", exact: true }).waitFor();
+    assert.equal(
+      refreshedRequests.filter(
+        ({ method, path }) => method === "GET" && path === `/native-admin/return/${key}`,
+      ).length,
+      2,
+    );
+    fixture.policy.restrictions.splice(fixture.policy.restrictions.indexOf(fullLoadRestriction), 1);
+  }
 });
 
 test("a refused provider exchange discards its pending login destination", async (t) => {

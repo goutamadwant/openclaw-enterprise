@@ -1979,6 +1979,9 @@ async function loadPage({
       ["agents", "secrets"].includes(current.feature) &&
       !namespaces.some((item) => item.id === namespaceId);
     let recoveringNativeAdmin = nativeRecoveryTarget && scopedNamespaceUnavailable;
+    if (recoveringNativeAdmin) {
+      nativeRecovery.required = true;
+    }
     if (current.namespace !== null && (!held || shownFeature === current.feature)) {
       // Namespace admission is done, so the header selector, when the shown page has one, is
       // usable while the destination's first read runs. A switch resets the lifetime, discarding
@@ -2018,6 +2021,7 @@ async function loadPage({
           }
         } catch (error) {
           if (nativeRecoveryTarget && error.status === 403) {
+            nativeRecovery.required = true;
             recoveringNativeAdmin = true;
           } else {
             throw error;
